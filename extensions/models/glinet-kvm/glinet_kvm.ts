@@ -402,17 +402,41 @@ export const transportFactory = {
  */
 export function unwrap(path: string, res: HttpResult): unknown {
   const text = new TextDecoder().decode(res.body);
-  let parsed: { ok?: boolean; result?: unknown } | null = null;
-  try {
-    parsed = JSON.parse(text);
-  } catch { /* not JSON */ }
-  if (parsed && typeof parsed === "object" && "ok" in parsed) {
-    if (parsed.ok) return parsed.result;
-    const r = (parsed.result ?? {}) as { error?: string; error_msg?: string };
+  type Envelope = { ok?: boolean; result?: unknown };
+  const isEnvelope = (v: unknown): v is Envelope =>
+    v !== null && typeof v === "object" && "ok" in v;
+  const fail = (e: Envelope): never => {
+    const r = (e.result ?? {}) as { error?: string; error_msg?: string };
     throw new Error(
       `${path}: HTTP ${res.status} ${r.error ?? "error"}: ${r.error_msg ?? ""}`
         .trim(),
     );
+  };
+
+  let parsed: unknown = undefined;
+  try {
+    parsed = JSON.parse(text);
+  } catch { /* not a single document; may be a stream */ }
+  if (isEnvelope(parsed)) return parsed.ok ? parsed.result : fail(parsed);
+
+  // Long operations (msd write_remote) stream one envelope per line as they
+  // progress, ending with the final state. Any failed line fails the call;
+  // otherwise the last line is the result.
+  const lines = text.split("\n").map((l) => l.trim()).filter(Boolean);
+  const envelopes: Envelope[] = [];
+  for (const line of lines) {
+    try {
+      const v = JSON.parse(line);
+      if (!isEnvelope(v)) break;
+      envelopes.push(v);
+    } catch {
+      break;
+    }
+  }
+  if (lines.length > 0 && envelopes.length === lines.length) {
+    const failed = envelopes.find((e) => !e.ok);
+    if (failed) fail(failed);
+    return envelopes[envelopes.length - 1].result;
   }
   throw new Error(
     `${path}: HTTP ${res.status}, not a kvmd response: ${text.slice(0, 120)}`,
@@ -853,8 +877,17 @@ export const msdSettle = { timeoutMs: 15000, intervalMs: 500 };
  */
 export const model = {
   type: "@sntxrr/glinet-kvm",
-  version: "2026.10.02.1",
+  version: "2026.10.02.2",
   globalArguments: GlobalArgsSchema,
+
+  upgrades: [
+    {
+      toVersion: "2026.10.02.2",
+      description:
+        "No schema change: accept kvmd's streamed (one envelope per line) responses, as returned by msd download.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+  ],
 
   resources: {
     health: {

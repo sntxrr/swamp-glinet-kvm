@@ -135,6 +135,50 @@ Deno.test("unwrap returns result on ok and names kvmd's error otherwise", () => 
   }
 });
 
+Deno.test("unwrap accepts a streamed response and returns the final line", () => {
+  // Shape of msd write_remote on firmware V1.9.1: one envelope per progress
+  // step. Seen live as `{"ok": true, "result": {"image": {..., "written": 0`.
+  const lines = [0, 852000000, 1706178560].map((w) =>
+    JSON.stringify({
+      ok: true,
+      result: { image: { name: "a.iso", size: 1706178560, written: w } },
+    })
+  );
+  const body = new TextEncoder().encode(lines.join("\n") + "\n");
+  const r = unwrap("/api/msd/write_remote", {
+    status: 200,
+    contentType: "application/x-ndjson",
+    body,
+  }) as { image: { written: number } };
+  assertEquals(r.image.written, 1706178560);
+});
+
+Deno.test("unwrap fails a stream when any line failed", () => {
+  const body = new TextEncoder().encode(
+    JSON.stringify({ ok: true, result: { image: { written: 0 } } }) + "\n" +
+      JSON.stringify({
+        ok: false,
+        result: { error: "MsdError", error_msg: "remote closed" },
+      }) + "\n",
+  );
+  try {
+    unwrap("/api/msd/write_remote", { status: 200, contentType: "", body });
+    throw new Error("should have thrown");
+  } catch (e) {
+    assertStringIncludes((e as Error).message, "remote closed");
+  }
+});
+
+Deno.test("unwrap still rejects text that is not kvmd JSON", () => {
+  const body = new TextEncoder().encode("<html>404</html>\n");
+  try {
+    unwrap("/x", { status: 404, contentType: "text/html", body });
+    throw new Error("should have thrown");
+  } catch (e) {
+    assertStringIncludes((e as Error).message, "not a kvmd response");
+  }
+});
+
 Deno.test("summariseMsd reports attachment, images and free space", () => {
   const s = summariseMsd({
     enabled: true,
