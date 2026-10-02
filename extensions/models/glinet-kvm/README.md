@@ -62,6 +62,7 @@ list of `findings`. An unreachable device or a rejected password is recorded as
 | `virtual_media_attached`    | warn               | An image is attached, and the next reboot may boot from it   |
 | `storage_partition_attached` | warn              | GL.iNet's own storage partition is exposed to the target     |
 | `viewer_failed`             | warn               | No viewer session could be opened, so video went unchecked   |
+| `virtual_media_not_presented` | info             | Attached per kvmd, but the USB mass-storage function is off  |
 | `clock_skew`                | warn               | The device clock is off by more than `maxClockSkewSeconds`   |
 | `two_factor_disabled`       | info (warn strict) | Web UI 2FA is off                                            |
 | `webterm_enabled`           | info (warn strict) | The browser web terminal (a root shell) is on                |
@@ -116,6 +117,18 @@ swamp model method run kvm-a atx --input action=reset_hard --input apply=true
 | `connect`    | `image`, `cdrom`    | `set_params`, then `set_connected?connected=1`             |
 | `disconnect` |                     | `set_connected?connected=0`                                |
 | `remove`     | `image`             | `POST /api/msd/remove`                                     |
+
+**An attach can be invisible to the target.** GL.iNet's USB gadget presents a
+CD-ROM or flash drive only when that function is enabled in the KVM's USB
+device settings (`start_cdrom` / `start_flash`, both off from the factory).
+With it off, kvmd still accepts the attach and reports `connected: true`, while
+the target enumerates nothing but the keyboard/mouse device. `connect` reads
+the gadget configuration and refuses in that case, and `health` reports such
+media as `virtual_media_not_presented` (info) rather than as attached. With the
+function on, an attached image appeared on a Proxmox target as a USB optical
+drive carrying the ISO's volume label. Turning the function on or off
+re-enumerates the KVM's USB device, so the target's KVM keyboard and mouse drop
+for a moment.
 
 The model refuses before calling anything when the image is missing, already
 exists, will not fit, is attached (for `remove`), or another image is already

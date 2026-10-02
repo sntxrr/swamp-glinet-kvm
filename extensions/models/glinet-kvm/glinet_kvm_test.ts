@@ -1,3 +1,5 @@
+// Tests hand the scripted context to execute() as `any`, as sibling extensions do.
+// deno-lint-ignore-file no-explicit-any
 import {
   assert,
   assertEquals,
@@ -10,10 +12,12 @@ import {
   certMatchesHost,
   curlConfig,
   curlQuote,
+  driveInvisible,
   evaluateHealth,
   type HealthFacts,
   type HttpResult,
   model,
+  msdSettle,
   parseCertText,
   type RequestOptions,
   resolutionOf,
@@ -23,6 +27,10 @@ import {
   unwrap,
   viewerHandshake,
 } from "./glinet_kvm.ts";
+
+// Fakes that never change state would otherwise wait out the real settle window.
+msdSettle.timeoutMs = 50;
+msdSettle.intervalMs = 1;
 
 // ---------------------------------------------------------------------------
 // Pure helpers
@@ -195,7 +203,6 @@ Deno.test("screenshot waits past the placeholder report until frames flow", asyn
     },
   }));
   const { context, getWrittenResources } = ctx();
-  // deno-lint-ignore no-explicit-any
   await withFake(
     fake,
     () =>
@@ -228,6 +235,7 @@ function facts(over: Partial<HealthFacts> = {}): HealthFacts {
     atxEnabled: false,
     msdConnected: false,
     msdImage: null,
+    msdInvisible: false,
     partitionConnected: false,
     hidOnline: true,
     twoFactorEnabled: false,
@@ -455,6 +463,10 @@ function healthyRoutes(
     "GET /api/hid": ok({ online: true }),
     "GET /api/2fa/is_enabled": ok({ enabled: false }),
     "GET /api/system/time": ok({ time: Math.floor(Date.now() / 1000) }),
+    "GET /api/system/otg_functions": ok({
+      start_cdrom: true,
+      start_flash: true,
+    }),
     "GET /api/streamer": ok({
       streamer: {
         source: {
@@ -491,7 +503,6 @@ function ctx() {
   });
 }
 
-// deno-lint-ignore no-explicit-any
 const parseArgs = (
   m: keyof typeof model.methods,
   a: Record<string, unknown>,
@@ -500,7 +511,6 @@ const parseArgs = (
 Deno.test("health records a reachable device, validates against its schema, closes the viewer", async () => {
   const fake = new FakeKvm(healthyRoutes());
   const { context, getWrittenResources } = ctx();
-  // deno-lint-ignore no-explicit-any
   await withFake(
     fake,
     () => model.methods.health.execute(parseArgs("health", {}), context as any),
@@ -520,7 +530,6 @@ Deno.test("health records a reachable device, validates against its schema, clos
 Deno.test("health records an unreachable device as fail instead of throwing", async () => {
   const fake = new FakeKvm({}, { unreachable: true });
   const { context, getWrittenResources } = ctx();
-  // deno-lint-ignore no-explicit-any
   await withFake(
     fake,
     () => model.methods.health.execute(parseArgs("health", {}), context as any),
@@ -537,14 +546,12 @@ Deno.test("health records a rejected password as auth_failed", async () => {
     "GET /api/auth/check": () => ({ status: 401, json: { ok: false } }),
   });
   const { context, getWrittenResources } = ctx();
-  // deno-lint-ignore no-explicit-any
   await withFake(
     fake,
     () => model.methods.health.execute(parseArgs("health", {}), context as any),
   );
   const [w] = getWrittenResources();
   assertEquals(w.data.authOk, false);
-  // deno-lint-ignore no-explicit-any
   assertEquals((w.data.findings as any[])[0].code, "auth_failed");
 });
 
@@ -556,7 +563,6 @@ Deno.test("health records a failing endpoint after auth as api_error instead of 
     }),
   }));
   const { context, getWrittenResources } = ctx();
-  // deno-lint-ignore no-explicit-any
   await withFake(
     fake,
     () => model.methods.health.execute(parseArgs("health", {}), context as any),
@@ -564,7 +570,6 @@ Deno.test("health records a failing endpoint after auth as api_error instead of 
   const [w] = getWrittenResources();
   model.resources.health.schema.parse(w.data);
   assertEquals(w.data.verdict, "fail");
-  // deno-lint-ignore no-explicit-any
   assertEquals((w.data.findings as any[])[0].code, "api_error");
 });
 
@@ -575,7 +580,6 @@ Deno.test("health records a refused viewer as a finding and still completes", as
       new Error("viewer websocket refused: HTTP/1.1 403 Forbidden"),
     );
   const { context, getWrittenResources } = ctx();
-  // deno-lint-ignore no-explicit-any
   await withFake(
     fake,
     () => model.methods.health.execute(parseArgs("health", {}), context as any),
@@ -583,7 +587,6 @@ Deno.test("health records a refused viewer as a finding and still completes", as
   const [w] = getWrittenResources();
   model.resources.health.schema.parse(w.data);
   assertEquals(w.data.videoOnline, null);
-  // deno-lint-ignore no-explicit-any
   assert((w.data.findings as any[]).some((f) => f.code === "viewer_failed"));
 });
 
@@ -595,7 +598,6 @@ Deno.test("health survives a firmware-server outage", async () => {
     }),
   }));
   const { context, getWrittenResources } = ctx();
-  // deno-lint-ignore no-explicit-any
   await withFake(
     fake,
     () => model.methods.health.execute(parseArgs("health", {}), context as any),
@@ -607,7 +609,6 @@ Deno.test("health survives a firmware-server outage", async () => {
 Deno.test("screenshot wakes the streamer, stores the JPEG and its metadata", async () => {
   const fake = new FakeKvm(healthyRoutes());
   const { context, getWrittenResources, getWrittenFiles } = ctx();
-  // deno-lint-ignore no-explicit-any
   await withFake(
     fake,
     () =>
@@ -636,7 +637,6 @@ Deno.test("screenshot with no HDMI signal records the fact, then fails", async (
   }));
   const { context, getWrittenResources, getWrittenFiles } = ctx();
   await assertRejects(
-    // deno-lint-ignore no-explicit-any
     () =>
       withFake(
         fake,
@@ -664,7 +664,6 @@ const ATX_BOARD = ok({
 Deno.test("atx status without a board reports power as unknown, not 'off'", async () => {
   const fake = new FakeKvm(healthyRoutes());
   const { context, getWrittenResources } = ctx();
-  // deno-lint-ignore no-explicit-any
   await withFake(
     fake,
     () => model.methods.atx.execute(parseArgs("atx", {}), context as any),
@@ -681,7 +680,6 @@ Deno.test("atx refuses a button press when there is no board, even with apply", 
   await assertRejects(
     () =>
       withFake(fake, () =>
-        // deno-lint-ignore no-explicit-any
         model.methods.atx.execute(
           parseArgs("atx", { action: "reset_hard", apply: true }),
           context as any,
@@ -696,7 +694,6 @@ Deno.test("atx refuses a button press when there is no board, even with apply", 
 Deno.test("atx with a board is a dry run by default", async () => {
   const fake = new FakeKvm(healthyRoutes({ "GET /api/atx": ATX_BOARD }));
   const { context, getWrittenResources } = ctx();
-  // deno-lint-ignore no-explicit-any
   await withFake(
     fake,
     () =>
@@ -715,7 +712,6 @@ Deno.test("atx apply posts the action and waits for it", async () => {
   );
   const { context, getWrittenResources } = ctx();
   await withFake(fake, () =>
-    // deno-lint-ignore no-explicit-any
     model.methods.atx.execute(
       parseArgs("atx", { action: "click_reset", apply: true }),
       context as any,
@@ -749,7 +745,6 @@ Deno.test("msd connect is a dry run by default and names both calls", async () =
   );
   const { context, getWrittenResources } = ctx();
   await withFake(fake, () =>
-    // deno-lint-ignore no-explicit-any
     model.methods.msd.execute(
       parseArgs("msd", { action: "connect", image: "rescue.iso" }),
       context as any,
@@ -777,13 +772,132 @@ Deno.test("msd connect apply selects the image, then attaches it", async () => {
         cdrom: false,
         apply: true,
       }),
-      // deno-lint-ignore no-explicit-any
       context as any,
     ));
   assertEquals(fake.posts().map((p) => [p.path, p.query]), [
     ["/api/msd/set_params", { image: "rescue.iso", cdrom: "0" }],
     ["/api/msd/set_connected", { connected: "1" }],
   ]);
+});
+
+Deno.test("msd waits for the device to drop a removed image before recording", async () => {
+  // kvmd applies storage changes asynchronously; the first read after a
+  // remove still lists the image. Seen live on firmware V1.9.1.
+  let removed = false, readsAfter = 0;
+  const fake = new FakeKvm(healthyRoutes({
+    "GET /api/msd": () => {
+      if (removed) readsAfter++;
+      const gone = removed && readsAfter > 2;
+      return MSD_WITH_IMAGE(false)().json && {
+        json: {
+          ok: true,
+          result: {
+            enabled: true,
+            busy: false,
+            drive: { connected: false, cdrom: true, image: null },
+            storage: {
+              images: gone ? {} : { "rescue.iso": { size: 10 } },
+              parts: { "": { free: 1000 } },
+            },
+          },
+        },
+      };
+    },
+    "POST /api/msd/remove":
+      () => ((removed = true), { json: { ok: true, result: {} } }),
+  }));
+  const { context, getWrittenResources } = ctx();
+  await withFake(fake, () =>
+    model.methods.msd.execute(
+      parseArgs("msd", { action: "remove", image: "rescue.iso", apply: true }),
+      context as any,
+    ));
+  const d = getWrittenResources()[0].data;
+  assertEquals(d.images, []);
+  assert(!String(d.message).includes("not yet updated"));
+  assertEquals(readsAfter, 3);
+});
+
+Deno.test("msd records, without failing, a change the device never shows", async () => {
+  const fake = new FakeKvm(healthyRoutes({
+    "GET /api/msd": MSD_WITH_IMAGE(false),
+    "POST /api/msd/remove": ok({}),
+  }));
+  const { context, getWrittenResources } = ctx();
+  await withFake(fake, () =>
+    model.methods.msd.execute(
+      parseArgs("msd", { action: "remove", image: "rescue.iso", apply: true }),
+      context as any,
+    ));
+  assertStringIncludes(
+    String(getWrittenResources()[0].data.message),
+    "not yet updated",
+  );
+});
+
+Deno.test("driveInvisible only claims invisibility when the gadget says so", () => {
+  assertEquals(driveInvisible({ cdrom: false, flash: true }, true), true);
+  assertEquals(driveInvisible({ cdrom: false, flash: true }, false), false);
+  assertEquals(driveInvisible({ cdrom: null, flash: null }, true), false);
+  assertEquals(driveInvisible({ cdrom: false, flash: false }, null), false);
+});
+
+Deno.test("msd refuses to connect a CD-ROM the gadget will not present", async () => {
+  // Seen live: kvmd accepted the attach and reported connected=true, and the
+  // target enumerated nothing but the keyboard/mouse composite device.
+  const fake = new FakeKvm(healthyRoutes({
+    "GET /api/msd": MSD_WITH_IMAGE(false),
+    "GET /api/system/otg_functions": ok({
+      start_cdrom: false,
+      start_flash: false,
+    }),
+  }));
+  const { context, getWrittenResources } = ctx();
+  await assertRejects(
+    () =>
+      withFake(fake, () =>
+        model.methods.msd.execute(
+          parseArgs("msd", {
+            action: "connect",
+            image: "rescue.iso",
+            apply: true,
+          }),
+          context as any,
+        )),
+    Error,
+    "start_cdrom=false",
+  );
+  const d = getWrittenResources()[0].data;
+  model.resources.msd.schema.parse(d);
+  assertEquals(d.outcome, "refused");
+  assertEquals(d.gadgetCdrom, false);
+  assertEquals(fake.posts().length, 0);
+});
+
+Deno.test("health does not warn about attached media the target cannot see", async () => {
+  const fake = new FakeKvm(healthyRoutes({
+    "GET /api/msd": MSD_WITH_IMAGE(true),
+    "GET /api/system/otg_functions": ok({
+      start_cdrom: false,
+      start_flash: false,
+    }),
+    "GET /api/upgrade/compare": ok({ server_version: "V1.9.1 release1" }),
+    "GET /api/upgrade/version": ok({
+      model: "RM1PE",
+      version: "V1.9.1 release1",
+    }),
+  }));
+  const { context, getWrittenResources } = ctx();
+  await withFake(
+    fake,
+    () => model.methods.health.execute(parseArgs("health", {}), context as any),
+  );
+  const d = getWrittenResources()[0].data;
+  model.resources.health.schema.parse(d);
+  const codes = (d.findings as any[]).map((f) => f.code);
+  assert(codes.includes("virtual_media_not_presented"));
+  assert(!codes.includes("virtual_media_attached"));
+  assertEquals(d.verdict, "ok");
 });
 
 Deno.test("msd refuses to remove the image that is attached", async () => {
@@ -800,7 +914,6 @@ Deno.test("msd refuses to remove the image that is attached", async () => {
             image: "rescue.iso",
             apply: true,
           }),
-          // deno-lint-ignore no-explicit-any
           context as any,
         )),
     Error,
@@ -823,7 +936,6 @@ Deno.test("msd upload refuses a file that does not exist", async () => {
             file: "/nonexistent/x.iso",
             apply: true,
           }),
-          // deno-lint-ignore no-explicit-any
           context as any,
         )),
     Error,

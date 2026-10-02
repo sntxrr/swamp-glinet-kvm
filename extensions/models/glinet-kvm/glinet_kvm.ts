@@ -462,6 +462,8 @@ export interface HealthFacts {
   atxEnabled: boolean;
   msdConnected: boolean;
   msdImage: string | null;
+  /** The attached drive is not presented because its USB function is off. */
+  msdInvisible: boolean;
   partitionConnected: boolean;
   hidOnline: boolean | null;
   twoFactorEnabled: boolean | null;
@@ -513,7 +515,15 @@ export function evaluateHealth(f: HealthFacts): {
         "USB HID is not enumerated by the target; keyboard and mouse will not work",
     });
   }
-  if (f.msdConnected) {
+  if (f.msdConnected && f.msdInvisible) {
+    findings.push({
+      severity: "info",
+      code: "virtual_media_not_presented",
+      message: `kvmd reports ${
+        f.msdImage ?? "an image"
+      } attached, but the USB gadget's mass-storage function is off, so the target cannot see it`,
+    });
+  } else if (f.msdConnected) {
     // A forgotten ISO is a boot-order landmine: the next reboot may boot it.
     findings.push({
       severity: "warn",
@@ -629,6 +639,12 @@ const HealthSchema = z.object({
     image: z.string().nullable(),
     images: z.array(z.string()),
     freeBytes: z.number().nullable(),
+    gadgetCdrom: z.boolean().nullable().describe(
+      "USB gadget presents a CD-ROM function (GL.iNet start_cdrom). Null if unknown.",
+    ),
+    gadgetFlash: z.boolean().nullable().describe(
+      "USB gadget presents a flash-drive function (GL.iNet start_flash). Null if unknown.",
+    ),
     partitionConnected: z.boolean().describe(
       "GL.iNet's own storage partition is attached to the target as a USB drive.",
     ),
@@ -667,6 +683,12 @@ const MsdSchema = z.object({
   cdrom: z.boolean().nullable(),
   images: z.array(z.object({ name: z.string(), size: z.number().nullable() })),
   freeBytes: z.number().nullable(),
+  gadgetCdrom: z.boolean().nullable().describe(
+    "USB gadget presents a CD-ROM function. When false, an attached CD-ROM image is invisible to the target.",
+  ),
+  gadgetFlash: z.boolean().nullable().describe(
+    "USB gadget presents a flash-drive function.",
+  ),
 });
 
 const ScreenshotMetaSchema = z.object({
@@ -732,6 +754,35 @@ export function resolutionOf(src: Json): string | null {
   return r?.width ? `${r.width}x${r.height}` : null;
 }
 
+/** Which mass-storage functions GL.iNet's USB gadget presents to the target. */
+export interface Gadget {
+  cdrom: boolean | null;
+  flash: boolean | null;
+}
+
+/**
+ * Read GL.iNet's USB gadget configuration. kvmd's own `/api/msd` reports a
+ * drive as `connected` even when the gadget has no mass-storage function, in
+ * which case the target sees nothing at all (verified: the target enumerated
+ * only the keyboard/mouse composite device). Nulls when the endpoint is
+ * absent, e.g. on upstream PiKVM.
+ */
+export async function readGadget(t: Transport): Promise<Gadget> {
+  const o: Json = await getJson(t, "/api/system/otg_functions").catch(() =>
+    null
+  );
+  return {
+    cdrom: typeof o?.start_cdrom === "boolean" ? o.start_cdrom : null,
+    flash: typeof o?.start_flash === "boolean" ? o.start_flash : null,
+  };
+}
+
+/** True when the gadget is known NOT to present the drive in its current mode. */
+export function driveInvisible(g: Gadget, cdrom: boolean | null): boolean {
+  if (cdrom === null) return false;
+  return (cdrom ? g.cdrom : g.flash) === false;
+}
+
 /** Wait for the woken streamer to report its source; null if it never does. */
 async function waitForSource(
   t: Transport,
@@ -785,6 +836,12 @@ const ATX_ACTIONS = {
 } as const;
 
 type AtxAction = keyof typeof ATX_ACTIONS;
+
+/**
+ * How long `msd` waits for the device to reflect an applied change. Exported
+ * so tests can shorten it.
+ */
+export const msdSettle = { timeoutMs: 15000, intervalMs: 500 };
 
 // ---------------------------------------------------------------------------
 // Model
@@ -926,6 +983,7 @@ export const model = {
         // scheduled check must leave something to alert on.
         let info: Json, sys: Json, version: Json, atx: Json, hid: Json;
         let msd: ReturnType<typeof summariseMsd>;
+        let gadget: Gadget;
         try {
           info = await getJson(t, "/api/info");
           sys = (await getJson(t, "/api/info", { fields: "system" }) as Json)
@@ -933,6 +991,7 @@ export const model = {
           version = await getJson(t, "/api/upgrade/version");
           atx = await getJson(t, "/api/atx");
           msd = summariseMsd(await getJson(t, "/api/msd"));
+          gadget = await readGadget(t);
           hid = await getJson(t, "/api/hid");
         } catch (e) {
           const msg = (e as Error).message;
@@ -1000,6 +1059,7 @@ export const model = {
           deviceTime: typeof time?.time === "number" ? time.time : null,
           atxEnabled: Boolean(atx?.enabled),
           msdConnected: msd.connected,
+          msdInvisible: driveInvisible(gadget, msd.cdrom),
           msdImage: msd.image,
           partitionConnected: msd.partitionConnected,
           hidOnline: typeof hid?.online === "boolean" ? hid.online : null,
@@ -1044,6 +1104,8 @@ export const model = {
             image: msd.image,
             images: msd.images.map((i) => i.name),
             freeBytes: msd.freeBytes,
+            gadgetCdrom: gadget.cdrom,
+            gadgetFlash: gadget.flash,
             partitionConnected: msd.partitionConnected,
           },
           twoFactorEnabled: typeof tfa?.enabled === "boolean"
@@ -1295,6 +1357,7 @@ export const model = {
         const g = context.globalArgs;
         const t = transportFactory.create(g);
         const state = summariseMsd(await getJson(t, "/api/msd"));
+        const gadget = await readGadget(t);
         const record = (
           s: ReturnType<typeof summariseMsd>,
           rec: { applied: boolean; outcome: string; message: string },
@@ -1310,6 +1373,8 @@ export const model = {
             cdrom: s.cdrom,
             images: s.images,
             freeBytes: s.freeBytes,
+            gadgetCdrom: gadget.cdrom,
+            gadgetFlash: gadget.flash,
           });
         const refuse = async (why: string): Promise<never> => {
           await record(state, {
@@ -1325,7 +1390,10 @@ export const model = {
             applied: false,
             outcome: "status",
             message: state.connected
-              ? `attached: ${state.image ?? "(unnamed)"}`
+              ? `attached: ${state.image ?? "(unnamed)"}` +
+                (driveInvisible(gadget, state.cdrom)
+                  ? " (not presented: USB mass-storage function is off)"
+                  : "")
               : `${state.images.length} image(s), nothing attached`,
           });
           return { dataHandles: [h] };
@@ -1385,6 +1453,17 @@ export const model = {
             break;
           case "connect":
             if (!exists) await refuse(`no image named ${name} on the device`);
+            if (driveInvisible(gadget, args.cdrom)) {
+              // kvmd would accept this and report connected=true while the
+              // target sees nothing. Refuse rather than report a false success.
+              await refuse(
+                `the KVM's USB ${
+                  args.cdrom ? "CD-ROM" : "flash-drive"
+                } function is disabled (${
+                  args.cdrom ? "start_cdrom" : "start_flash"
+                }=false), so the target would not see the image; enable it in the KVM's USB device settings first`,
+              );
+            }
             if (state.connected) {
               await refuse(
                 `${
@@ -1436,11 +1515,45 @@ export const model = {
           plan: describe,
         });
         for (const p of plan) await postJson(t, p.path, p.query, p.opts);
-        const after = summariseMsd(await getJson(t, "/api/msd"));
+
+        // kvmd applies storage changes asynchronously: read straight after a
+        // remove and the image is still listed. Poll until the device shows the
+        // change, so the record describes the device rather than a stale read.
+        const settled = (m: ReturnType<typeof summariseMsd>): boolean => {
+          const has = m.images.some((i) => i.name === name);
+          switch (args.action) {
+            case "upload":
+            case "download":
+              return has && !m.busy;
+            case "connect":
+              return m.connected && m.image === name;
+            case "disconnect":
+              return !m.connected;
+            case "remove":
+              return !has && !m.busy;
+          }
+          return true;
+        };
+        let after = summariseMsd(await getJson(t, "/api/msd"));
+        const until = Date.now() + msdSettle.timeoutMs;
+        while (!settled(after) && Date.now() < until) {
+          await sleep(msdSettle.intervalMs);
+          after = summariseMsd(await getJson(t, "/api/msd"));
+        }
+        const ok = settled(after);
+        if (!ok) {
+          context.logger.warn(
+            "MSD {action} on {host}: calls succeeded but the device has not shown the change after {ms}ms",
+            { action: args.action, host: g.host, ms: msdSettle.timeoutMs },
+          );
+        }
         const h = await record(after, {
           applied: true,
           outcome: "done",
-          message: `${args.action} done: ${describe}`,
+          message: `${args.action} done: ${describe}` +
+            (ok
+              ? ""
+              : ` (device state not yet updated after ${msdSettle.timeoutMs}ms)`),
         });
         return { dataHandles: [h] };
       },
