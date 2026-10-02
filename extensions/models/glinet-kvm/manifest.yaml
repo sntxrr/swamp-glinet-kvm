@@ -1,0 +1,25 @@
+manifestVersion: 1
+
+name: "@sntxrr/glinet-kvm"
+version: "2026.10.02.1"
+description: "Operate GL.iNet KVMs (Comet GL-RM1 / GL-RM1PE) from swamp: health, screenshots, ATX power and virtual media. The firmware is a fork of PiKVM's kvmd, and three of its behaviours shape this model. The factory TLS certificate is self-signed, names CN=localhost and expired in 1979, so it cannot be validated or pinned; HTTP goes through curl and the viewer through openssl, with credentials on stdin rather than argv. The video streamer sleeps until a viewer connects, so a bare snapshot request answers 503 whether or not there is a signal; screenshot and health open a receive-only viewer session first and never send input. Without the ATX add-on board, the API still reports power 'off' for a running machine; this model reports the state as unknown and refuses to press a button wired to nothing. health flags available firmware updates, missing HDMI signal, offline USB HID, forgotten virtual media that could hijack the next boot, clock skew, and security posture (2FA off, browser root shell on, untrusted TLS). atx and msd are dry runs unless apply is true."
+repository: "https://github.com/sntxrr/swamp-glinet-kvm"
+
+paths:
+  base: manifest
+
+models:
+  - glinet_kvm.ts
+
+additionalFiles:
+  - README.md
+  - LICENSE.md
+
+labels:
+  - glinet
+  - kvm
+  - pikvm
+  - kvmd
+  - ip-kvm
+  - out-of-band
+  - homelab

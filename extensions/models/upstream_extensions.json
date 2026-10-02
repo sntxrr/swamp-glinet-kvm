@@ -1,0 +1,17 @@
+{
+  "@swamp/1password": {
+    "version": "2026.09.10.0",
+    "pulledAt": "2026-10-02T17:22:36.138Z",
+    "files": [
+      ".swamp/pulled-extensions/@swamp/1password/files/LICENSE.txt",
+      ".swamp/pulled-extensions/@swamp/1password/files/README.md",
+      ".swamp/pulled-extensions/@swamp/1password/manifest.yaml",
+      ".swamp/pulled-extensions/@swamp/1password/vaults/_lib/tracing.ts",
+      ".swamp/pulled-extensions/@swamp/1password/vaults/onepassword.ts",
+      ".swamp/vault-bundles/a52f5a8b/onepassword.js"
+    ],
+    "checksum": "ab0046c5e873d7717e33547b20dc41d3d56bdeffb028f2d7007dbd52a5267a6b",
+    "filesChecksum": "d70b51364976ea68b446192735eb614943e383c1ae6f7cc1493664526f0a07e1",
+    "serverUrl": "https://swamp-club.com"
+  }
+}
