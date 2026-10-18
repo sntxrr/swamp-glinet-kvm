@@ -68,7 +68,8 @@ list of `findings`. An unreachable device or a rejected password is recorded as
 | `webterm_enabled`           | info (warn strict) | The browser web terminal (a root shell) is on                |
 | `tls_untrusted`             | info (warn strict) | Self-signed, expired, or not naming the host                 |
 | `atx_absent`                | info               | No ATX board, so power state and control are unavailable     |
-| `tailscale_unreachable`     | warn               | With `tailnetIp`: the web UI did not answer on that address  |
+| `tailscale_unreachable`     | warn               | With `tailnetIp`: nothing answered on that address           |
+| `tailscale_wrong_device`    | warn               | With `tailnetIp`: something other than this KVM answered     |
 | `tailscale_ip_changed`      | warn               | With `tailnetIp`: the device reports a different tailnet IP  |
 | `tailscale_not_running`     | warn               | Tailscale is enabled, but tailscaled is not running          |
 | `tailscale_not_connected`   | warn               | tailscaled is in a state other than `Running` (e.g. logged out) |
@@ -78,16 +79,29 @@ Posture findings are `info` by default because every factory-fresh device has
 them. Pass `strictSecurity: true` to make them count toward the verdict.
 
 **Tailscale.** `health` reads GL.iNet's `GET /api/tailscale/config`, `/status`
-and `/login_status` (firmware without them answers 404, and `tailscale` is then
-recorded as null). It never calls `GET /api/tailscale/login`, which is not
-read-only: it starts a login. The device's own view is not enough on its own: a
-node deleted from the tailnet keeps reporting `Running`, because the device
-cannot tell that its node is gone. Set the `tailnetIp` global argument to have
-`health` also fetch the web UI's login page on that address, which proves the
-path from the tailnet node swamp runs behind. That request is **anonymous**: the
-probe matters most when the pinned address is stale, and then whatever answers
-there is not this KVM, so it must not be sent the password. A re-added node gets a new address, so
+and `/login_status`. A 404 means the firmware has no Tailscale API; any other
+failure is logged. It never calls `GET /api/tailscale/login`, which is not
+read-only: it starts a login. `tailscale` is null only when the device could not
+be read, or when it has no Tailscale API **and** no `tailnetIp` is set; with
+`tailnetIp` set the object is always present and its device fields may be null.
+
+The device's own view is not enough: a node deleted from the tailnet keeps
+reporting `Running`, because the device cannot tell its node is gone. Set the
+`tailnetIp` global argument to have `health` also probe that address from the
+tailnet node swamp runs behind. The probe is **anonymous**, and its transport is
+built without credentials: it matters most when the pinned address is stale,
+and then whatever answers there is not this KVM. Identity is proved without a
+password instead: kvmd answers an anonymous `GET /api/auth/check` with its own
+`401 {"ok": false}` envelope, and each device has its own TLS certificate, so
+the certificate on the tailnet address must match the one on `host`.
+`tailscale_unreachable` means nothing answered; `tailscale_wrong_device` means
+something else did. A re-added node gets a new address, so
 `tailscale_ip_changed` names both and the fix is updating `tailnetIp`.
+
+All HTTP goes through `curl -q` with `noproxy = "*"`: `-q` keeps a user's
+`~/.curlrc` (a `verbose` there would print the password header into errors) out
+of it, and the KVM is always reached directly, never through a proxy that would
+see the credentials over unverified TLS.
 
 Arguments: `checkVideo` (default `true`), `checkFirmware` (default `true`; the
 device asks GL.iNet's servers, and a failure there is logged, not counted),
@@ -177,15 +191,16 @@ or don't use this model.
 
 ## Scheduling
 
-`health` is cheap: about a dozen GET requests and a viewer session of a second or
-two. Hourly is reasonable. Alert on `verdict != "ok"` and on the age of the
+`health` is cheap: about seventeen GET requests, a viewer session of a second or
+two, and with `tailnetIp` one anonymous GET and a TLS handshake on that address. Hourly is reasonable. Alert on `verdict != "ok"` and on the age of the
 latest `health` record, so a check that stops running is noticed too.
 
 ## Development
 
 ```bash
 ~/.swamp/deno/deno check glinet_kvm.ts
-~/.swamp/deno/deno test --allow-read --allow-env --allow-write glinet_kvm_test.ts
+~/.swamp/deno/deno test --allow-read --allow-env --allow-write \
+  --allow-net=127.0.0.1 --allow-run=curl,openssl glinet_kvm_test.ts
 ```
 
 The tests run against a scripted fake of kvmd through `transportFactory`, and

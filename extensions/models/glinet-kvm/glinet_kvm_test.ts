@@ -5,11 +5,13 @@ import {
   assertEquals,
   assertRejects,
   assertStringIncludes,
+  assertThrows,
 } from "jsr:@std/assert@1";
 import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20260928.39";
 import {
   type CertInfo,
   certMatchesHost,
+  CliTransport,
   curlConfig,
   curlQuote,
   driveInvisible,
@@ -19,6 +21,7 @@ import {
   model,
   msdSettle,
   parseCertText,
+  redactUrl,
   type RequestOptions,
   resolutionOf,
   summariseMsd,
@@ -607,6 +610,7 @@ Deno.test("health records a rejected password as auth_failed", async () => {
     () => model.methods.health.execute(parseArgs("health", {}), context as any),
   );
   const [w] = getWrittenResources();
+  model.resources.health.schema.parse(w.data);
   assertEquals(w.data.authOk, false);
   assertEquals((w.data.findings as any[])[0].code, "auth_failed");
 });
@@ -1018,7 +1022,12 @@ Deno.test("Tailscale up and answering on its tailnet IP adds no finding", () => 
   assertEquals(
     tsCodes(facts({
       tailscale: TS_UP,
-      tailnet: { ip: "198.51.100.7", reachable: true, error: null },
+      tailnet: {
+        ip: "198.51.100.7",
+        reachable: true,
+        sameDevice: true,
+        error: null,
+      },
     })),
     [],
   );
@@ -1027,7 +1036,12 @@ Deno.test("Tailscale up and answering on its tailnet IP adds no finding", () => 
 Deno.test("a node deleted from the tailnet still says Running; only the probe catches it", () => {
   const f = facts({
     tailscale: TS_UP,
-    tailnet: { ip: "198.51.100.7", reachable: false, error: "curl exit 28" },
+    tailnet: {
+      ip: "198.51.100.7",
+      reachable: false,
+      sameDevice: null,
+      error: "curl exit 28",
+    },
   });
   assertEquals(tsCodes(f), ["warn tailscale_unreachable"]);
   assertEquals(evaluateHealth(f).verdict, "warn");
@@ -1036,7 +1050,12 @@ Deno.test("a node deleted from the tailnet still says Running; only the probe ca
 Deno.test("a re-added node with a new IP warns and names both addresses", () => {
   const { findings } = evaluateHealth(facts({
     tailscale: { ...TS_UP, ip: "198.51.100.9" },
-    tailnet: { ip: "198.51.100.7", reachable: false, error: null },
+    tailnet: {
+      ip: "198.51.100.7",
+      reachable: false,
+      sameDevice: null,
+      error: null,
+    },
   }));
   const changed = findings.find((x) => x.code === "tailscale_ip_changed")!;
   assertEquals(changed.severity, "warn");
@@ -1050,7 +1069,12 @@ Deno.test("Tailscale off is info unless a tailnetIp says it is relied on", () =>
   assertEquals(
     tsCodes(facts({
       tailscale: off,
-      tailnet: { ip: "198.51.100.7", reachable: false, error: null },
+      tailnet: {
+        ip: "198.51.100.7",
+        reachable: false,
+        sameDevice: null,
+        error: null,
+      },
     })),
     ["warn tailscale_disabled", "warn tailscale_unreachable"],
   );
@@ -1070,7 +1094,9 @@ Deno.test("enabled but stopped, or logged out, warns with the daemon's state", (
   );
 });
 
-function tailscaleRoutes(): Record<string, Route> {
+function tailscaleRoutes(
+  over: Record<string, Route> = {},
+): Record<string, Route> {
   return healthyRoutes({
     "GET /api/tailscale/config": ok({
       accept_dns: false,
@@ -1086,15 +1112,21 @@ function tailscaleRoutes(): Record<string, Route> {
       login_name: "someone@example.com",
       status: "Running",
     }),
+    ...over,
   });
 }
+
+/** Global arguments of every transport the code under test created. */
+const created: any[] = [];
 
 async function withHosts<T>(
   fakes: Record<string, FakeKvm>,
   fn: () => Promise<T>,
 ): Promise<T> {
   const orig = transportFactory.create;
+  created.length = 0;
   transportFactory.create = (g) => {
+    created.push(g);
     const f = fakes[g.host];
     if (!f) throw new Error(`no fake for ${g.host}`);
     return f;
@@ -1116,14 +1148,25 @@ function tailnetCtx() {
   });
 }
 
-Deno.test("health probes the tailnet IP and records Tailscale, using only read-only GETs", async () => {
-  const lan = new FakeKvm(tailscaleRoutes());
-  const tailnet = new FakeKvm({
-    "GET /": () => ({
-      raw: new TextEncoder().encode("<html>"),
-      type: "text/html",
+const CERT_A: CertInfo = { ...FACTORY_CERT, fingerprint: "AA:11" };
+const CERT_B: CertInfo = { ...FACTORY_CERT, fingerprint: "BB:22" };
+
+/** A kvmd on the tailnet IP: anonymous auth check answers its 401 envelope. */
+function kvmdTailnet(cert: CertInfo = CERT_A): FakeKvm {
+  return new FakeKvm({
+    "GET /api/auth/check": () => ({
+      status: 401,
+      json: {
+        ok: false,
+        result: { error: "UnauthorizedError", error_msg: "Unauthorized" },
+      },
     }),
-  });
+  }, { cert });
+}
+
+Deno.test("health probes the tailnet IP and records Tailscale, using only read-only GETs", async () => {
+  const lan = new FakeKvm(tailscaleRoutes(), { cert: CERT_A });
+  const tailnet = kvmdTailnet();
   const { context, getWrittenResources } = tailnetCtx();
   await withHosts(
     { "192.0.2.10": lan, "198.51.100.7": tailnet },
@@ -1138,15 +1181,20 @@ Deno.test("health probes the tailnet IP and records Tailscale, using only read-o
     ip: "198.51.100.7",
     expectedIp: "198.51.100.7",
     tailnetReachable: true,
+    tailnetSameDevice: true,
   });
   assertEquals(
     (w.data.findings as any[]).filter((f) => f.code.startsWith("tailscale_")),
     [],
   );
-  // The pinned address may not be this KVM: never send it the password.
+  // The pinned address may not be this KVM: never send it the password, and
+  // never even hand the probe's transport one.
   assertEquals(tailnet.calls.map((c) => [c.method, c.path, c.anonymous]), [
-    ["GET", "/", true],
+    ["GET", "/api/auth/check", true],
   ]);
+  const probeG = created.find((g) => g.host === "198.51.100.7");
+  assertEquals([probeG.username, probeG.password], ["", ""]);
+  assert(probeG.timeoutMs <= 10000);
   // GET /api/tailscale/login is NOT read-only: it starts a login.
   assert(!lan.calls.some((c) => c.path === "/api/tailscale/login"));
   assertEquals(lan.posts().length + tailnet.posts().length, 0);
@@ -1186,20 +1234,259 @@ Deno.test("firmware without a Tailscale API leaves tailscale null and adds no fi
   );
 });
 
-Deno.test("tailnetIp must be an IPv4 literal", () => {
-  assertRejects(() =>
-    Promise.resolve().then(() =>
-      model.globalArguments.parse({
-        host: "192.0.2.10",
-        password: "x",
-        tailnetIp: "kvm1.example.ts.net",
-      })
-    )
-  );
+Deno.test("tailnetIp must be a valid IPv4 literal", () => {
+  for (
+    const bad of [
+      "kvm1.example.com",
+      "256.1.1.1",
+      "198.51.100",
+      "198.051.100.7",
+    ]
+  ) {
+    assertThrows(
+      () =>
+        model.globalArguments.parse({
+          host: "192.0.2.10",
+          password: "x",
+          tailnetIp: bad,
+        }),
+      Error,
+      undefined,
+      bad,
+    );
+  }
 });
 
 Deno.test("an anonymous request carries no credentials at all", () => {
   const cfg = curlConfig(G, "GET", "/", "/tmp/out", { anonymous: true });
   assert(!cfg.includes("X-KVMD"), cfg);
   assertStringIncludes(curlConfig(G, "GET", "/", "/tmp/out"), "X-KVMD-Passwd");
+});
+
+async function runTailnet(lan: FakeKvm, tailnet: FakeKvm) {
+  const { context, getWrittenResources } = tailnetCtx();
+  await withHosts(
+    { "192.0.2.10": lan, "198.51.100.7": tailnet },
+    () => model.methods.health.execute(parseArgs("health", {}), context as any),
+  );
+  const [w] = getWrittenResources();
+  model.resources.health.schema.parse(w.data);
+  return w.data as any;
+}
+
+const codesOf = (d: any) =>
+  (d.findings as any[]).filter((f) => f.code.startsWith("tailscale_")).map((
+    f,
+  ) => f.code);
+
+Deno.test("a stale pin answered by some other web server is tailscale_wrong_device, not healthy", async () => {
+  const other = new FakeKvm({
+    "GET /api/auth/check": () => ({
+      raw: new TextEncoder().encode("<html>hello</html>"),
+      type: "text/html",
+    }),
+  });
+  const d = await runTailnet(
+    new FakeKvm(tailscaleRoutes(), { cert: CERT_A }),
+    other,
+  );
+  assertEquals(d.tailscale.tailnetReachable, true);
+  assertEquals(d.tailscale.tailnetSameDevice, false);
+  assertEquals(codesOf(d), ["tailscale_wrong_device"]);
+  assertEquals(d.verdict, "warn");
+});
+
+Deno.test("a different kvmd on the tailnet IP (other certificate) is tailscale_wrong_device", async () => {
+  const d = await runTailnet(
+    new FakeKvm(tailscaleRoutes(), { cert: CERT_A }),
+    kvmdTailnet(CERT_B),
+  );
+  assertEquals(d.tailscale.tailnetSameDevice, false);
+  assertEquals(codesOf(d), ["tailscale_wrong_device"]);
+});
+
+Deno.test("an unjudgeable certificate leaves sameDevice null and raises nothing", async () => {
+  const d = await runTailnet(
+    new FakeKvm(tailscaleRoutes(), { cert: null }),
+    kvmdTailnet(),
+  );
+  assertEquals(d.tailscale.tailnetReachable, true);
+  assertEquals(d.tailscale.tailnetSameDevice, null);
+  assertEquals(codesOf(d), []);
+});
+
+Deno.test("tailnetIp on firmware without a Tailscale API records the probe with null device fields", async () => {
+  const d = await runTailnet(
+    new FakeKvm(healthyRoutes(), { cert: CERT_A }),
+    kvmdTailnet(),
+  );
+  assertEquals(d.tailscale, {
+    enabled: null,
+    running: null,
+    state: null,
+    ip: null,
+    expectedIp: "198.51.100.7",
+    tailnetReachable: true,
+    tailnetSameDevice: true,
+  });
+});
+
+Deno.test("a Tailscale endpoint error is logged, not read as 'no API', and non-string fields are dropped", async () => {
+  const lan = new FakeKvm(
+    tailscaleRoutes({
+      "GET /api/tailscale/status": () => ({ status: 500, json: { ok: false } }),
+      "GET /api/tailscale/login_status": ok({
+        ipv4: ["198.51.100.7"],
+        status: 7,
+      }),
+    }),
+    { cert: CERT_A },
+  );
+  const { context, getWrittenResources, getLogs } = tailnetCtx() as any;
+  await withHosts(
+    { "192.0.2.10": lan, "198.51.100.7": kvmdTailnet() },
+    () => model.methods.health.execute(parseArgs("health", {}), context as any),
+  );
+  const [w] = getWrittenResources();
+  model.resources.health.schema.parse(w.data);
+  const ts = (w.data as any).tailscale;
+  assertEquals([ts.running, ts.state, ts.ip], [null, null, null]);
+  assert(!codesOf(w.data).includes("tailscale_ip_changed"));
+  assert(
+    JSON.stringify(getLogs()).includes("/api/tailscale/status"),
+    "the failure must be logged",
+  );
+});
+
+Deno.test("curl config skips proxies, and an anonymous request carries no credentials", () => {
+  const cfg = curlConfig(G, "GET", "/", "/tmp/out");
+  assertStringIncludes(cfg, 'noproxy = "*"');
+  const anon = curlConfig(G, "GET", "/", "/tmp/out", { anonymous: true });
+  assert(!anon.includes("X-KVMD"), anon);
+  assertStringIncludes(anon, 'noproxy = "*"');
+});
+
+Deno.test("redactUrl strips userinfo and signed queries from a download URL", () => {
+  assertEquals(
+    redactUrl("https://u:p@iso.example.com/a/b.iso?X-Amz-Signature=s#f"),
+    "https://iso.example.com/a/b.iso (redacted)",
+  );
+  assertEquals(
+    redactUrl("https://iso.example.com/b.iso"),
+    "https://iso.example.com/b.iso",
+  );
+  assertEquals(redactUrl("not a url"), "(unparseable URL)");
+});
+
+Deno.test("msd download never records or logs the credentials in its URL", async () => {
+  const fake = new FakeKvm(healthyRoutes());
+  const { context, getWrittenResources } = ctx();
+  await withFake(
+    fake,
+    () =>
+      model.methods.msd.execute(
+        parseArgs("msd", {
+          action: "download",
+          image: "x.iso",
+          url: "https://u:secretpw@iso.example.com/x.iso?sig=abc",
+        }),
+        context as any,
+      ),
+  );
+  const [w] = getWrittenResources();
+  assert(!JSON.stringify(w.data).includes("secretpw"));
+  assert(!JSON.stringify(w.data).includes("sig=abc"));
+  assertEquals(w.data.outcome, "dry-run");
+});
+
+Deno.test("msd disconnect with nothing attached, and remove of a missing image, succeed as no-ops", async () => {
+  for (
+    const args of [
+      { action: "disconnect", apply: true },
+      { action: "remove", image: "gone.iso", apply: true },
+    ]
+  ) {
+    const fake = new FakeKvm(healthyRoutes());
+    const { context, getWrittenResources } = ctx();
+    await withFake(
+      fake,
+      () => model.methods.msd.execute(parseArgs("msd", args), context as any),
+    );
+    const [w] = getWrittenResources();
+    model.resources.msd.schema.parse(w.data);
+    assertEquals(w.data.outcome, "done");
+    assertEquals(w.data.applied, false);
+    assertEquals(fake.posts().length, 0, `${args.action} must not POST`);
+  }
+});
+
+Deno.test("CliTransport ignores ~/.curlrc, so a 'verbose' there cannot print the password", async () => {
+  // A local TLS server that sends headers and then stalls, so curl times out
+  // and its stderr is surfaced in the error, as it would be from a real KVM.
+  const dir = await Deno.makeTempDir();
+  const oldHome = Deno.env.get("HOME");
+  const oldCurlHome = Deno.env.get("CURL_HOME");
+  try {
+    const gen = await new Deno.Command("openssl", {
+      args: [
+        "req",
+        "-x509",
+        "-newkey",
+        "ec",
+        "-pkeyopt",
+        "ec_paramgen_curve:P-256",
+        "-nodes",
+        "-subj",
+        "/CN=localhost",
+        "-days",
+        "1",
+        "-keyout",
+        `${dir}/key.pem`,
+        "-out",
+        `${dir}/cert.pem`,
+      ],
+      stdout: "null",
+      stderr: "null",
+    }).output();
+    assert(gen.success, "openssl could not make a test certificate");
+    await Deno.writeTextFile(`${dir}/.curlrc`, "verbose\n");
+    Deno.env.set("HOME", dir);
+    Deno.env.set("CURL_HOME", dir);
+    const server = Deno.listenTls({
+      hostname: "127.0.0.1",
+      port: 0,
+      cert: await Deno.readTextFile(`${dir}/cert.pem`),
+      key: await Deno.readTextFile(`${dir}/key.pem`),
+    });
+    const port = (server.addr as Deno.NetAddr).port;
+    const held: Deno.Conn[] = [];
+    (async () => {
+      for await (const c of server) held.push(c); // accept, never answer
+    })().catch(() => {});
+    try {
+      const t = new CliTransport(model.globalArguments.parse({
+        host: "127.0.0.1",
+        port,
+        password: "pw-must-not-leak",
+        timeoutMs: 1000,
+      }));
+      const e = await assertRejects(() => t.request("GET", "/api/auth/check"));
+      assert(
+        !(e as Error).message.includes("pw-must-not-leak"),
+        (e as Error).message,
+      );
+      assert(!(e as Error).message.includes("X-KVMD-Passwd"));
+    } finally {
+      server.close();
+      for (const c of held) c.close();
+    }
+  } finally {
+    oldHome === undefined
+      ? Deno.env.delete("HOME")
+      : Deno.env.set("HOME", oldHome);
+    oldCurlHome === undefined
+      ? Deno.env.delete("CURL_HOME")
+      : Deno.env.set("CURL_HOME", oldCurlHome);
+    await Deno.remove(dir, { recursive: true });
+  }
 });
