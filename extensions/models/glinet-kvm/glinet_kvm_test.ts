@@ -410,7 +410,12 @@ type Route = (
 
 /** A scripted kvmd. Records every request so tests can prove what was NOT sent. */
 class FakeKvm implements Transport {
-  calls: { method: string; path: string; query: Record<string, string> }[] = [];
+  calls: {
+    method: string;
+    path: string;
+    query: Record<string, string>;
+    anonymous?: boolean;
+  }[] = [];
   viewers = 0;
   closed = 0;
   constructor(
@@ -429,7 +434,12 @@ class FakeKvm implements Transport {
       );
     }
     const query = o.query ?? {};
-    this.calls.push({ method, path, query });
+    this.calls.push({
+      method,
+      path,
+      query,
+      ...(o.anonymous ? { anonymous: true } : {}),
+    });
     const route = this.routes[`${method} ${path}`];
     if (!route) {
       return Promise.resolve({
@@ -1108,7 +1118,12 @@ function tailnetCtx() {
 
 Deno.test("health probes the tailnet IP and records Tailscale, using only read-only GETs", async () => {
   const lan = new FakeKvm(tailscaleRoutes());
-  const tailnet = new FakeKvm({ "GET /api/auth/check": ok({}) });
+  const tailnet = new FakeKvm({
+    "GET /": () => ({
+      raw: new TextEncoder().encode("<html>"),
+      type: "text/html",
+    }),
+  });
   const { context, getWrittenResources } = tailnetCtx();
   await withHosts(
     { "192.0.2.10": lan, "198.51.100.7": tailnet },
@@ -1128,8 +1143,9 @@ Deno.test("health probes the tailnet IP and records Tailscale, using only read-o
     (w.data.findings as any[]).filter((f) => f.code.startsWith("tailscale_")),
     [],
   );
-  assertEquals(tailnet.calls.map((c) => `${c.method} ${c.path}`), [
-    "GET /api/auth/check",
+  // The pinned address may not be this KVM: never send it the password.
+  assertEquals(tailnet.calls.map((c) => [c.method, c.path, c.anonymous]), [
+    ["GET", "/", true],
   ]);
   // GET /api/tailscale/login is NOT read-only: it starts a login.
   assert(!lan.calls.some((c) => c.path === "/api/tailscale/login"));
@@ -1180,4 +1196,10 @@ Deno.test("tailnetIp must be an IPv4 literal", () => {
       })
     )
   );
+});
+
+Deno.test("an anonymous request carries no credentials at all", () => {
+  const cfg = curlConfig(G, "GET", "/", "/tmp/out", { anonymous: true });
+  assert(!cfg.includes("X-KVMD"), cfg);
+  assertStringIncludes(curlConfig(G, "GET", "/", "/tmp/out"), "X-KVMD-Passwd");
 });

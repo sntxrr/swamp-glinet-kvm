@@ -83,8 +83,10 @@ recorded as null). It never calls `GET /api/tailscale/login`, which is not
 read-only: it starts a login. The device's own view is not enough on its own: a
 node deleted from the tailnet keeps reporting `Running`, because the device
 cannot tell that its node is gone. Set the `tailnetIp` global argument to have
-`health` also connect to the web UI on that address, which proves the path from
-the tailnet node swamp runs behind. A re-added node gets a new address, so
+`health` also fetch the web UI's login page on that address, which proves the
+path from the tailnet node swamp runs behind. That request is **anonymous**: the
+probe matters most when the pinned address is stale, and then whatever answers
+there is not this KVM, so it must not be sent the password. A re-added node gets a new address, so
 `tailscale_ip_changed` names both and the fix is updating `tailnetIp`.
 
 Arguments: `checkVideo` (default `true`), `checkFirmware` (default `true`; the

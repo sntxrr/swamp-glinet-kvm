@@ -97,6 +97,8 @@ export interface RequestOptions {
   /** Local file streamed as the request body (MSD upload). */
   uploadFile?: string;
   timeoutMs?: number;
+  /** Send no credentials: for an address that may not be this KVM. */
+  anonymous?: boolean;
 }
 
 /** Peer certificate facts, as far as `openssl` can tell. */
@@ -168,8 +170,10 @@ export function curlConfig(
     `request = ${curlQuote(method)}`,
     `max-time = ${Math.ceil((opts.timeoutMs ?? g.timeoutMs) / 1000)}`,
     `connect-timeout = 10`,
-    `header = ${curlQuote(`X-KVMD-User: ${g.username}`)}`,
-    `header = ${curlQuote(`X-KVMD-Passwd: ${g.password}`)}`,
+    ...(opts.anonymous ? [] : [
+      `header = ${curlQuote(`X-KVMD-User: ${g.username}`)}`,
+      `header = ${curlQuote(`X-KVMD-Passwd: ${g.password}`)}`,
+    ]),
     `output = ${curlQuote(outFile)}`,
     `write-out = ${curlQuote("%{http_code}\\t%{content_type}")}`,
   ];
@@ -1192,21 +1196,25 @@ export const model = {
           }
           : null;
 
+        // Anonymous, deliberately. The probe exists for the case where the
+        // pinned address is stale, and then whatever answers there is not this
+        // KVM: with TLS unverifiable, sending the password would hand it over.
+        // The login page proves the path; the device's own reported IP (above)
+        // is what proves identity.
         let tailnet: TailnetProbe | null = null;
         if (g.tailnetIp) {
           try {
             const status = (await transportFactory.create({
               ...g,
               host: g.tailnetIp,
-            }).request("GET", "/api/auth/check", {
+            }).request("GET", "/", {
               timeoutMs: Math.min(g.timeoutMs, 10000),
+              anonymous: true,
             })).status;
             tailnet = {
               ip: g.tailnetIp,
               reachable: status === 200,
-              error: status === 200
-                ? null
-                : `auth check returned HTTP ${status}`,
+              error: status === 200 ? null : `web UI returned HTTP ${status}`,
             };
           } catch (e) {
             tailnet = {
