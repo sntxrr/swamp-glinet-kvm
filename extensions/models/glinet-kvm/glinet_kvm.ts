@@ -68,7 +68,7 @@ const GlobalArgsSchema = z.object({
   timeoutMs: z.number().int().positive().default(15000).describe(
     "Per-request timeout for API calls (uploads and downloads take their own).",
   ),
-  tailnetIp: z.string().regex(/^\d{1,3}(\.\d{1,3}){3}$/).optional().describe(
+  tailnetIp: z.ipv4().optional().describe(
     "The KVM's Tailscale IPv4 address. When set, `health` checks that the " +
       "device reports this address and that its web UI answers on it — the " +
       "only test that catches a node deleted from the tailnet, which the " +
@@ -107,6 +107,8 @@ export interface CertInfo {
   issuer: string;
   notAfter: string | null;
   sans: string[];
+  /** SHA-256 of the DER certificate, `AA:BB:…`; null when openssl did not give one. */
+  fingerprint: string | null;
 }
 
 /** A live viewer session that keeps the streamer awake until closed. */
@@ -138,6 +140,22 @@ export function isIpLiteral(host: string): boolean {
   return /^\d{1,3}(\.\d{1,3}){3}$/.test(host) || host.includes(":");
 }
 
+/**
+ * A URL safe to log: scheme, host and path, with any userinfo, query and
+ * fragment removed. Exported for tests.
+ */
+export function redactUrl(raw: string): string {
+  try {
+    const u = new URL(raw);
+    const hidden = u.username || u.password || u.search || u.hash;
+    return `${u.protocol}//${u.host}${u.pathname}${
+      hidden ? " (redacted)" : ""
+    }`;
+  } catch {
+    return "(unparseable URL)";
+  }
+}
+
 /** Build `https://host:port/path?query`. */
 export function buildUrl(
   g: Pick<GlobalArgs, "host" | "port">,
@@ -165,6 +183,9 @@ export function curlConfig(
     `url = ${curlQuote(buildUrl(g, path, opts.query))}`,
     // The factory certificate is self-signed, CN=localhost, expired in 1979.
     "insecure",
+    // A proxy would see the credentials (TLS is unverified) and would make the
+    // tailnet probe test the proxy's path instead of this host's.
+    'noproxy = "*"',
     "silent",
     "show-error",
     `request = ${curlQuote(method)}`,
@@ -221,6 +242,8 @@ export function parseCertText(text: string): CertInfo {
     issuer: line(/Issuer:\s*([^\n]+)/),
     notAfter: Number.isNaN(parsed) ? null : new Date(parsed).toISOString(),
     sans,
+    fingerprint: text.match(/sha256 Fingerprint=([0-9A-F:]+)/i)?.[1]
+      ?.toUpperCase() ?? null,
   };
 }
 
@@ -230,6 +253,10 @@ async function runCommand(
   stdin: string,
   timeoutMs: number,
 ): Promise<{ code: number; stdout: Uint8Array; stderr: string }> {
+  // Only `curl` and `openssl`, with argv built from schema-validated globals
+  // and credentials on stdin: the device's expired self-signed certificate
+  // rules out Deno's fetch, and there is no swamp primitive for it (README).
+  // swamp-quality-ignore deno-command
   const child = new Deno.Command(cmd, {
     args,
     stdin: "piped",
@@ -241,11 +268,14 @@ async function runCommand(
       child.kill("SIGKILL");
     } catch { /* already exited */ }
   }, timeoutMs);
+  // Start draining output before writing: a child that exits early (EPIPE on
+  // stdin) must still be reaped, and a full stdout pipe must not stall it.
+  const output = child.output();
   try {
     const w = child.stdin.getWriter();
-    await w.write(new TextEncoder().encode(stdin));
-    await w.close();
-    const out = await child.output();
+    await w.write(new TextEncoder().encode(stdin)).catch(() => {});
+    await w.close().catch(() => {});
+    const out = await output;
     return {
       code: out.code,
       stdout: out.stdout,
@@ -253,6 +283,7 @@ async function runCommand(
     };
   } finally {
     clearTimeout(timer);
+    await output.catch(() => {});
   }
 }
 
@@ -271,13 +302,15 @@ export class CliTransport implements Transport {
       const timeoutMs = opts.timeoutMs ?? this.g.timeoutMs;
       const res = await runCommand(
         "curl",
-        ["-K", "-"],
+        // -q first: without it curl also reads ~/.curlrc, and a `verbose` there
+        // would print the X-KVMD-Passwd header into stderr, which is surfaced.
+        ["-q", "-K", "-"],
         curlConfig(this.g, method, path, outFile, opts),
         timeoutMs + 5000,
       );
       if (res.code !== 0) {
-        // curl's stderr names the failure (refused, timeout, DNS) and never
-        // echoes the config it read, so it is safe to surface.
+        // curl's stderr names the failure (refused, timeout, DNS) and, with -q
+        // and no ~/.curlrc, never echoes the config it read.
         throw new Error(
           `${method} ${path} on ${this.g.host} failed (curl exit ${res.code}): ${res.stderr.trim()}`,
         );
@@ -303,6 +336,8 @@ export class CliTransport implements Transport {
       `${this.g.host}:${this.g.port}`,
     ];
     if (!isIpLiteral(this.g.host)) args.push("-servername", this.g.host);
+    // The viewer websocket needs TLS without verification; see runCommand.
+    // swamp-quality-ignore deno-command
     const child = new Deno.Command("openssl", {
       args,
       stdin: "piped",
@@ -320,7 +355,16 @@ export class CliTransport implements Transport {
       String.fromCharCode(...crypto.getRandomValues(new Uint8Array(16))),
     );
     const writer = child.stdin.getWriter();
-    await writer.write(new TextEncoder().encode(viewerHandshake(this.g, key)));
+    try {
+      await writer.write(
+        new TextEncoder().encode(viewerHandshake(this.g, key)),
+      );
+    } catch (e) {
+      await close();
+      throw new Error(
+        `viewer connection to ${this.g.host} failed: ${(e as Error).message}`,
+      );
+    }
     // stdin stays open: closing it would end the TLS session.
 
     const reader = child.stdout.getReader();
@@ -386,7 +430,7 @@ export class CliTransport implements Transport {
     if (!pem) return null;
     const dump = await runCommand(
       "openssl",
-      ["x509", "-noout", "-text"],
+      ["x509", "-noout", "-text", "-fingerprint", "-sha256"],
       pem + "\n",
       this.g.timeoutMs,
     );
@@ -523,10 +567,17 @@ export interface TailscaleState {
   ip: string | null;
 }
 
-/** Whether the web UI answered on the configured tailnet IP. */
+/** What answered on the configured tailnet IP, probed without credentials. */
 export interface TailnetProbe {
   ip: string;
+  /** Anything answered over HTTPS. */
   reachable: boolean;
+  /**
+   * The answer came from this KVM: kvmd's anonymous 401 envelope, and the same
+   * TLS certificate as on the LAN address (each device has its own). False
+   * when something else answers; null when it could not be judged.
+   */
+  sameDevice: boolean | null;
   error: string | null;
 }
 
@@ -673,9 +724,20 @@ export function evaluateHealth(f: HealthFacts): {
     findings.push({
       severity: "warn",
       code: "tailscale_unreachable",
-      message: `the web UI did not answer on tailnet IP ${f.tailnet.ip}${
+      message: `nothing answered on tailnet IP ${f.tailnet.ip}${
         f.tailnet.error ? `: ${f.tailnet.error}` : ""
       }`,
+    });
+  } else if (f.tailnet && f.tailnet.sameDevice === false) {
+    // A stale pin whose address now belongs to another node would otherwise
+    // read as a healthy path.
+    findings.push({
+      severity: "warn",
+      code: "tailscale_wrong_device",
+      message:
+        `something other than this KVM answers on tailnet IP ${f.tailnet.ip}${
+          f.tailnet.error ? `: ${f.tailnet.error}` : ""
+        }`,
     });
   }
   if (f.cert) {
@@ -758,10 +820,13 @@ const HealthSchema = z.object({
       "The configured tailnetIp, or null when none is set.",
     ),
     tailnetReachable: z.boolean().nullable().describe(
-      "The web UI answered on expectedIp. Null when no tailnetIp is set.",
+      "Something answered on expectedIp. Null when no tailnetIp is set.",
+    ),
+    tailnetSameDevice: z.boolean().nullable().describe(
+      "The answer on expectedIp came from this KVM (kvmd's anonymous 401 and the LAN certificate). Null when no tailnetIp is set or it could not be judged.",
     ),
   }).nullable().describe(
-    "Null when the device could not be read or its firmware has no Tailscale API.",
+    "Null when the device could not be read, or when its firmware has no Tailscale API AND no tailnetIp is set. With tailnetIp set the object is present and the device fields may be null.",
   ),
   error: z.string().nullable(),
 });
@@ -964,7 +1029,7 @@ export const msdSettle = { timeoutMs: 15000, intervalMs: 500 };
  */
 export const model = {
   type: "@sntxrr/glinet-kvm",
-  version: "2026.10.18.1",
+  version: "2026.10.18.2",
   globalArguments: GlobalArgsSchema,
 
   upgrades: [
@@ -978,6 +1043,12 @@ export const model = {
       toVersion: "2026.10.18.1",
       description:
         "Adds the optional tailnetIp argument; health records Tailscale state and probes the tailnet path. Existing instances need no change.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.18.2",
+      description:
+        "No argument change. Review fixes: the tailnet probe proves identity (kvmd's anonymous 401 and the LAN certificate) and records tailnetSameDevice; curl ignores ~/.curlrc and proxies; msd disconnect/remove are idempotent; download URLs are redacted.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -1021,7 +1092,7 @@ export const model = {
   methods: {
     health: {
       description:
-        "Read-only health check: reachability, auth, firmware currency, HDMI signal, USB HID, attached virtual media, clock skew, ATX presence, Tailscale (state, and the tailnet path when tailnetIp is set) and security posture (2FA, web terminal, TLS). Records an unreachable device as verdict 'fail' rather than throwing, so a scheduled check always leaves a record.",
+        "Read-only health check: reachability, auth, firmware currency, HDMI signal, USB HID, attached virtual media, clock skew, ATX presence, Tailscale (state, and with tailnetIp an anonymous probe of the tailnet path that also checks the same device answers) and security posture (2FA, web terminal, TLS). Records an unreachable device as verdict 'fail' rather than throwing, so a scheduled check always leaves a record.",
       arguments: z.object({
         checkVideo: z.boolean().default(true).describe(
           "Wake the streamer with a receive-only viewer session to test for an HDMI signal. Sends no input.",
@@ -1048,6 +1119,7 @@ export const model = {
         const g = context.globalArgs;
         const t = transportFactory.create(g);
         const checkedAt = new Date();
+        context.logger.info("KVM {host}: checking health", { host: g.host });
         const blank = {
           host: g.host,
           checkedAt: checkedAt.toISOString(),
@@ -1091,6 +1163,7 @@ export const model = {
         }
         if (authStatus !== 200) {
           const msg = `auth check returned HTTP ${authStatus}`;
+          context.logger.warn("KVM {host}: {msg}", { host: g.host, msg });
           const h = await context.writeResource("health", "health", {
             ...blank,
             reachable: true,
@@ -1177,12 +1250,27 @@ export const model = {
         }
 
         // GETs only, by name: GL.iNet's GET /api/tailscale/login starts a login.
-        // Firmware without the API answers 404, which leaves tailscale null.
+        // A 404 means the firmware has no Tailscale API; any other failure is
+        // logged, so an outage is not silently read as "no API".
+        const readTs = async (name: string): Promise<Json> => {
+          const path = `/api/tailscale/${name}`;
+          try {
+            const res = await t.request("GET", path);
+            return res.status === 404 ? null : unwrap(path, res);
+          } catch (e) {
+            context.logger.warn("KVM {host}: {path} failed: {msg}", {
+              host: g.host,
+              path,
+              msg: (e as Error).message,
+            });
+            return null;
+          }
+        };
         const [tsConfig, tsStatus, tsLogin]: Json[] = await Promise.all(
-          ["config", "status", "login_status"].map((p) =>
-            getJson(t, `/api/tailscale/${p}`).catch(() => null)
-          ),
+          ["config", "status", "login_status"].map(readTs),
         );
+        const str = (v: unknown): string | null =>
+          typeof v === "string" && v ? v : null;
         const tailscale: TailscaleState | null = tsConfig || tsStatus || tsLogin
           ? {
             enabled: typeof tsConfig?.enable === "boolean"
@@ -1191,41 +1279,72 @@ export const model = {
             running: typeof tsStatus?.running === "boolean"
               ? tsStatus.running
               : null,
-            state: tsLogin?.status || null,
-            ip: tsLogin?.ipv4 || null,
+            state: str(tsLogin?.status),
+            ip: str(tsLogin?.ipv4),
           }
           : null;
 
-        // Anonymous, deliberately. The probe exists for the case where the
-        // pinned address is stale, and then whatever answers there is not this
-        // KVM: with TLS unverifiable, sending the password would hand it over.
-        // The login page proves the path; the device's own reported IP (above)
-        // is what proves identity.
+        const cert = await t.peerCertificate().catch(() => null);
+
+        // Anonymous, deliberately: the probe matters most when the pinned
+        // address is stale, and then whatever answers there is not this KVM.
+        // With TLS unverifiable, sending the password would hand it over, so
+        // the probe's transport carries no credentials at all. Identity is
+        // proved without them: kvmd answers an anonymous auth check with its
+        // own 401 envelope, and each device has its own TLS certificate.
         let tailnet: TailnetProbe | null = null;
         if (g.tailnetIp) {
+          const probeT = transportFactory.create({
+            ...g,
+            host: g.tailnetIp,
+            username: "",
+            password: "",
+            timeoutMs: Math.min(g.timeoutMs, 10000),
+          });
           try {
-            const status = (await transportFactory.create({
-              ...g,
-              host: g.tailnetIp,
-            }).request("GET", "/", {
-              timeoutMs: Math.min(g.timeoutMs, 10000),
+            const res = await probeT.request("GET", "/api/auth/check", {
               anonymous: true,
-            })).status;
+            });
+            let body: Json = null;
+            try {
+              body = JSON.parse(new TextDecoder().decode(res.body));
+            } catch { /* not JSON: not kvmd */ }
+            const isKvmd = res.status === 401 && body?.ok === false;
+            const there = isKvmd
+              ? await probeT.peerCertificate().catch(() => null)
+              : null;
+            const sameCert = there?.fingerprint && cert?.fingerprint
+              ? there.fingerprint === cert.fingerprint
+              : null;
             tailnet = {
               ip: g.tailnetIp,
-              reachable: status === 200,
-              error: status === 200 ? null : `web UI returned HTTP ${status}`,
+              reachable: true,
+              sameDevice: !isKvmd ? false : sameCert,
+              error: !isKvmd
+                ? `the auth check answered HTTP ${res.status}, not kvmd's 401`
+                : sameCert === false
+                ? "kvmd answered, with a different TLS certificate than the LAN address"
+                : null,
             };
           } catch (e) {
             tailnet = {
               ip: g.tailnetIp,
               reachable: false,
+              sameDevice: null,
               error: (e as Error).message,
             };
           }
+          context.logger.info(
+            "KVM {host}: tailnet {ip} reachable={reachable} sameDevice={same}",
+            {
+              host: g.host,
+              ip: g.tailnetIp,
+              reachable: tailnet.reachable,
+              same: String(tailnet.sameDevice),
+            },
+          );
         }
 
-        const cert = await t.peerCertificate().catch(() => null);
         const webterm = Boolean(info?.extras?.webterm?.enabled);
         const { findings, verdict } = evaluateHealth({
           host: g.host,
@@ -1299,6 +1418,7 @@ export const model = {
               ip: tailscale?.ip ?? null,
               expectedIp: tailnet?.ip ?? null,
               tailnetReachable: tailnet?.reachable ?? null,
+              tailnetSameDevice: tailnet?.sameDevice ?? null,
             }
             : null,
           error: null,
@@ -1668,14 +1788,29 @@ export const model = {
             ];
             break;
           case "disconnect":
-            if (!state.connected) await refuse("nothing is attached");
+            if (!state.connected) {
+              // Already in the requested state: report it, do not fail.
+              const h = await record(state, {
+                applied: false,
+                outcome: "done",
+                message: "nothing is attached; nothing to do",
+              });
+              return { dataHandles: [h] };
+            }
             plan = [{
               path: "/api/msd/set_connected",
               query: { connected: "0" },
             }];
             break;
           case "remove":
-            if (!exists) await refuse(`no image named ${name} on the device`);
+            if (!exists) {
+              const h = await record(state, {
+                applied: false,
+                outcome: "done",
+                message: `no image named ${name} on the device; nothing to do`,
+              });
+              return { dataHandles: [h] };
+            }
             if (state.connected && state.image === name) {
               await refuse(
                 `${name} is attached to the target; disconnect first`,
@@ -1685,9 +1820,13 @@ export const model = {
             break;
         }
 
-        const describe = plan.map((p) =>
-          `POST ${p.path}?${new URLSearchParams(p.query)}`
-        )
+        // A download URL can carry credentials (user:pass@ or a signed query);
+        // the plan is logged and stored, so it shows only scheme, host and path.
+        const describe = plan.map((p) => {
+          const q = { ...p.query };
+          if (q.url) q.url = redactUrl(q.url);
+          return `POST ${p.path}?${new URLSearchParams(q)}`;
+        })
           .join(", then ");
         if (!args.apply) {
           const h = await record(state, {
