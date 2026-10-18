@@ -68,6 +68,13 @@ const GlobalArgsSchema = z.object({
   timeoutMs: z.number().int().positive().default(15000).describe(
     "Per-request timeout for API calls (uploads and downloads take their own).",
   ),
+  tailnetIp: z.string().regex(/^\d{1,3}(\.\d{1,3}){3}$/).optional().describe(
+    "The KVM's Tailscale IPv4 address. When set, `health` checks that the " +
+      "device reports this address and that its web UI answers on it — the " +
+      "only test that catches a node deleted from the tailnet, which the " +
+      "device itself still reports as Running. An IP, not a MagicDNS name: " +
+      "inside a container a short name can be completed by a search domain.",
+  ),
 });
 
 /** Validated global arguments for one KVM. */
@@ -497,6 +504,26 @@ export interface HealthFacts {
   cert: CertInfo | null;
   strictSecurity: boolean;
   maxClockSkewSeconds: number;
+  /** Tailscale as the device reports it; null when the firmware has no API for it. */
+  tailscale: TailscaleState | null;
+  /** The probe of `tailnetIp`; null when no tailnetIp is configured. */
+  tailnet: TailnetProbe | null;
+}
+
+/** GL.iNet's own view of Tailscale, from /api/tailscale/{config,status,login_status}. */
+export interface TailscaleState {
+  enabled: boolean | null;
+  running: boolean | null;
+  /** tailscaled's backend state, e.g. "Running". */
+  state: string | null;
+  ip: string | null;
+}
+
+/** Whether the web UI answered on the configured tailnet IP. */
+export interface TailnetProbe {
+  ip: string;
+  reachable: boolean;
+  error: string | null;
 }
 
 /** True when the certificate names `host` in a SAN, or in its CN when SAN-less. */
@@ -605,6 +632,48 @@ export function evaluateHealth(f: HealthFacts): {
       message: "the browser web terminal (a root shell) is enabled",
     });
   }
+  const ts = f.tailscale;
+  if (ts) {
+    // Off on purpose is a choice, unless a tailnet IP says it is relied on.
+    if (ts.enabled === false) {
+      findings.push({
+        severity: f.tailnet ? "warn" : "info",
+        code: "tailscale_disabled",
+        message: "Tailscale is turned off on the device",
+      });
+    } else if (ts.running === false) {
+      findings.push({
+        severity: "warn",
+        code: "tailscale_not_running",
+        message: "Tailscale is enabled but tailscaled is not running",
+      });
+    } else if (ts.state && ts.state !== "Running") {
+      findings.push({
+        severity: "warn",
+        code: "tailscale_not_connected",
+        message: `tailscaled is in state ${ts.state}`,
+      });
+    }
+    if (f.tailnet && ts.ip && ts.ip !== f.tailnet.ip) {
+      findings.push({
+        severity: "warn",
+        code: "tailscale_ip_changed",
+        message:
+          `the device reports tailnet IP ${ts.ip}, not the configured ${f.tailnet.ip}; the node was probably re-added, so update tailnetIp`,
+      });
+    }
+  }
+  // The device can say Running while its node is gone from the tailnet: only
+  // a connection from another node proves the path.
+  if (f.tailnet && !f.tailnet.reachable) {
+    findings.push({
+      severity: "warn",
+      code: "tailscale_unreachable",
+      message: `the web UI did not answer on tailnet IP ${f.tailnet.ip}${
+        f.tailnet.error ? `: ${f.tailnet.error}` : ""
+      }`,
+    });
+  }
   if (f.cert) {
     const problems: string[] = [];
     if (f.cert.subject === f.cert.issuer) problems.push("self-signed");
@@ -676,6 +745,20 @@ const HealthSchema = z.object({
   twoFactorEnabled: z.boolean().nullable(),
   webtermEnabled: z.boolean().nullable(),
   certNotAfter: z.string().nullable(),
+  tailscale: z.object({
+    enabled: z.boolean().nullable(),
+    running: z.boolean().nullable(),
+    state: z.string().nullable(),
+    ip: z.string().nullable().describe("Tailnet IPv4 the device reports."),
+    expectedIp: z.string().nullable().describe(
+      "The configured tailnetIp, or null when none is set.",
+    ),
+    tailnetReachable: z.boolean().nullable().describe(
+      "The web UI answered on expectedIp. Null when no tailnetIp is set.",
+    ),
+  }).nullable().describe(
+    "Null when the device could not be read or its firmware has no Tailscale API.",
+  ),
   error: z.string().nullable(),
 });
 
@@ -877,7 +960,7 @@ export const msdSettle = { timeoutMs: 15000, intervalMs: 500 };
  */
 export const model = {
   type: "@sntxrr/glinet-kvm",
-  version: "2026.10.02.2",
+  version: "2026.10.18.1",
   globalArguments: GlobalArgsSchema,
 
   upgrades: [
@@ -885,6 +968,12 @@ export const model = {
       toVersion: "2026.10.02.2",
       description:
         "No schema change: accept kvmd's streamed (one envelope per line) responses, as returned by msd download.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
+    {
+      toVersion: "2026.10.18.1",
+      description:
+        "Adds the optional tailnetIp argument; health records Tailscale state and probes the tailnet path. Existing instances need no change.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],
@@ -928,7 +1017,7 @@ export const model = {
   methods: {
     health: {
       description:
-        "Read-only health check: reachability, auth, firmware currency, HDMI signal, USB HID, attached virtual media, clock skew, ATX presence and security posture (2FA, web terminal, TLS). Records an unreachable device as verdict 'fail' rather than throwing, so a scheduled check always leaves a record.",
+        "Read-only health check: reachability, auth, firmware currency, HDMI signal, USB HID, attached virtual media, clock skew, ATX presence, Tailscale (state, and the tailnet path when tailnetIp is set) and security posture (2FA, web terminal, TLS). Records an unreachable device as verdict 'fail' rather than throwing, so a scheduled check always leaves a record.",
       arguments: z.object({
         checkVideo: z.boolean().default(true).describe(
           "Wake the streamer with a receive-only viewer session to test for an HDMI signal. Sends no input.",
@@ -973,6 +1062,7 @@ export const model = {
           twoFactorEnabled: null,
           webtermEnabled: null,
           certNotAfter: null,
+          tailscale: null,
         };
 
         // Reachability and auth first: a down device is a record, not a throw.
@@ -1082,6 +1172,51 @@ export const model = {
           }
         }
 
+        // GETs only, by name: GL.iNet's GET /api/tailscale/login starts a login.
+        // Firmware without the API answers 404, which leaves tailscale null.
+        const [tsConfig, tsStatus, tsLogin]: Json[] = await Promise.all(
+          ["config", "status", "login_status"].map((p) =>
+            getJson(t, `/api/tailscale/${p}`).catch(() => null)
+          ),
+        );
+        const tailscale: TailscaleState | null = tsConfig || tsStatus || tsLogin
+          ? {
+            enabled: typeof tsConfig?.enable === "boolean"
+              ? tsConfig.enable
+              : null,
+            running: typeof tsStatus?.running === "boolean"
+              ? tsStatus.running
+              : null,
+            state: tsLogin?.status || null,
+            ip: tsLogin?.ipv4 || null,
+          }
+          : null;
+
+        let tailnet: TailnetProbe | null = null;
+        if (g.tailnetIp) {
+          try {
+            const status = (await transportFactory.create({
+              ...g,
+              host: g.tailnetIp,
+            }).request("GET", "/api/auth/check", {
+              timeoutMs: Math.min(g.timeoutMs, 10000),
+            })).status;
+            tailnet = {
+              ip: g.tailnetIp,
+              reachable: status === 200,
+              error: status === 200
+                ? null
+                : `auth check returned HTTP ${status}`,
+            };
+          } catch (e) {
+            tailnet = {
+              ip: g.tailnetIp,
+              reachable: false,
+              error: (e as Error).message,
+            };
+          }
+        }
+
         const cert = await t.peerCertificate().catch(() => null);
         const webterm = Boolean(info?.extras?.webterm?.enabled);
         const { findings, verdict } = evaluateHealth({
@@ -1105,6 +1240,8 @@ export const model = {
           cert,
           strictSecurity: args.strictSecurity,
           maxClockSkewSeconds: args.maxClockSkewSeconds,
+          tailscale,
+          tailnet,
         });
 
         context.logger.info("KVM {host}: {verdict} ({n} findings)", {
@@ -1146,6 +1283,16 @@ export const model = {
             : null,
           webtermEnabled: webterm,
           certNotAfter: cert?.notAfter ?? null,
+          tailscale: tailscale || tailnet
+            ? {
+              enabled: tailscale?.enabled ?? null,
+              running: tailscale?.running ?? null,
+              state: tailscale?.state ?? null,
+              ip: tailscale?.ip ?? null,
+              expectedIp: tailnet?.ip ?? null,
+              tailnetReachable: tailnet?.reachable ?? null,
+            }
+            : null,
           error: null,
         });
         return { dataHandles: [h] };

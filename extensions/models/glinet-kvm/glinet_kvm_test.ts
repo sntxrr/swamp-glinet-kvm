@@ -289,6 +289,8 @@ function facts(over: Partial<HealthFacts> = {}): HealthFacts {
     cert: FACTORY_CERT,
     strictSecurity: false,
     maxClockSkewSeconds: 300,
+    tailscale: null,
+    tailnet: null,
     ...over,
   };
 }
@@ -986,4 +988,196 @@ Deno.test("msd upload refuses a file that does not exist", async () => {
     "not a readable file",
   );
   assertEquals(fake.posts().length, 0);
+});
+
+// ---------------------------------------------------------------------------
+// Tailscale
+// ---------------------------------------------------------------------------
+
+const TS_UP = {
+  enabled: true,
+  running: true,
+  state: "Running",
+  ip: "198.51.100.7",
+};
+const tsCodes = (f: HealthFacts) =>
+  evaluateHealth(f).findings.filter((x) => x.code.startsWith("tailscale_"))
+    .map((x) => `${x.severity} ${x.code}`);
+
+Deno.test("Tailscale up and answering on its tailnet IP adds no finding", () => {
+  assertEquals(
+    tsCodes(facts({
+      tailscale: TS_UP,
+      tailnet: { ip: "198.51.100.7", reachable: true, error: null },
+    })),
+    [],
+  );
+});
+
+Deno.test("a node deleted from the tailnet still says Running; only the probe catches it", () => {
+  const f = facts({
+    tailscale: TS_UP,
+    tailnet: { ip: "198.51.100.7", reachable: false, error: "curl exit 28" },
+  });
+  assertEquals(tsCodes(f), ["warn tailscale_unreachable"]);
+  assertEquals(evaluateHealth(f).verdict, "warn");
+});
+
+Deno.test("a re-added node with a new IP warns and names both addresses", () => {
+  const { findings } = evaluateHealth(facts({
+    tailscale: { ...TS_UP, ip: "198.51.100.9" },
+    tailnet: { ip: "198.51.100.7", reachable: false, error: null },
+  }));
+  const changed = findings.find((x) => x.code === "tailscale_ip_changed")!;
+  assertEquals(changed.severity, "warn");
+  assertStringIncludes(changed.message, "198.51.100.9");
+  assertStringIncludes(changed.message, "198.51.100.7");
+});
+
+Deno.test("Tailscale off is info unless a tailnetIp says it is relied on", () => {
+  const off = { ...TS_UP, enabled: false, running: false, state: "Stopped" };
+  assertEquals(tsCodes(facts({ tailscale: off })), ["info tailscale_disabled"]);
+  assertEquals(
+    tsCodes(facts({
+      tailscale: off,
+      tailnet: { ip: "198.51.100.7", reachable: false, error: null },
+    })),
+    ["warn tailscale_disabled", "warn tailscale_unreachable"],
+  );
+});
+
+Deno.test("enabled but stopped, or logged out, warns with the daemon's state", () => {
+  assertEquals(
+    tsCodes(facts({ tailscale: { ...TS_UP, running: false } })),
+    ["warn tailscale_not_running"],
+  );
+  const { findings } = evaluateHealth(facts({
+    tailscale: { ...TS_UP, state: "NeedsLogin" },
+  }));
+  assertStringIncludes(
+    findings.find((x) => x.code === "tailscale_not_connected")!.message,
+    "NeedsLogin",
+  );
+});
+
+function tailscaleRoutes(): Record<string, Route> {
+  return healthyRoutes({
+    "GET /api/tailscale/config": ok({
+      accept_dns: false,
+      accept_routes: false,
+      advertise_routes: "",
+      enable: true,
+      exit_node: false,
+    }),
+    "GET /api/tailscale/status": ok({ running: true }),
+    "GET /api/tailscale/login_status": ok({
+      ipv4: "198.51.100.7",
+      ipv6: "",
+      login_name: "someone@example.com",
+      status: "Running",
+    }),
+  });
+}
+
+async function withHosts<T>(
+  fakes: Record<string, FakeKvm>,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const orig = transportFactory.create;
+  transportFactory.create = (g) => {
+    const f = fakes[g.host];
+    if (!f) throw new Error(`no fake for ${g.host}`);
+    return f;
+  };
+  try {
+    return await fn();
+  } finally {
+    transportFactory.create = orig;
+  }
+}
+
+function tailnetCtx() {
+  return createModelTestContext({
+    globalArgs: model.globalArguments.parse({
+      host: "192.0.2.10",
+      password: "x",
+      tailnetIp: "198.51.100.7",
+    }),
+  });
+}
+
+Deno.test("health probes the tailnet IP and records Tailscale, using only read-only GETs", async () => {
+  const lan = new FakeKvm(tailscaleRoutes());
+  const tailnet = new FakeKvm({ "GET /api/auth/check": ok({}) });
+  const { context, getWrittenResources } = tailnetCtx();
+  await withHosts(
+    { "192.0.2.10": lan, "198.51.100.7": tailnet },
+    () => model.methods.health.execute(parseArgs("health", {}), context as any),
+  );
+  const [w] = getWrittenResources();
+  model.resources.health.schema.parse(w.data);
+  assertEquals(w.data.tailscale, {
+    enabled: true,
+    running: true,
+    state: "Running",
+    ip: "198.51.100.7",
+    expectedIp: "198.51.100.7",
+    tailnetReachable: true,
+  });
+  assertEquals(
+    (w.data.findings as any[]).filter((f) => f.code.startsWith("tailscale_")),
+    [],
+  );
+  assertEquals(tailnet.calls.map((c) => `${c.method} ${c.path}`), [
+    "GET /api/auth/check",
+  ]);
+  // GET /api/tailscale/login is NOT read-only: it starts a login.
+  assert(!lan.calls.some((c) => c.path === "/api/tailscale/login"));
+  assertEquals(lan.posts().length + tailnet.posts().length, 0);
+});
+
+Deno.test("health records an unanswered tailnet IP as tailscale_unreachable, not a throw", async () => {
+  const lan = new FakeKvm(tailscaleRoutes());
+  const tailnet = new FakeKvm({}, { unreachable: true });
+  const { context, getWrittenResources } = tailnetCtx();
+  await withHosts(
+    { "192.0.2.10": lan, "198.51.100.7": tailnet },
+    () => model.methods.health.execute(parseArgs("health", {}), context as any),
+  );
+  const [w] = getWrittenResources();
+  model.resources.health.schema.parse(w.data);
+  assertEquals(w.data.reachable, true);
+  assertEquals((w.data.tailscale as any).tailnetReachable, false);
+  const f = (w.data.findings as any[]).find((x) =>
+    x.code === "tailscale_unreachable"
+  );
+  assertEquals(f.severity, "warn");
+  assertStringIncludes(f.message, "Failed to connect");
+});
+
+Deno.test("firmware without a Tailscale API leaves tailscale null and adds no finding", async () => {
+  const fake = new FakeKvm(healthyRoutes());
+  const { context, getWrittenResources } = ctx();
+  await withFake(
+    fake,
+    () => model.methods.health.execute(parseArgs("health", {}), context as any),
+  );
+  const [w] = getWrittenResources();
+  model.resources.health.schema.parse(w.data);
+  assertEquals(w.data.tailscale, null);
+  assert(
+    !(w.data.findings as any[]).some((f) => f.code.startsWith("tailscale_")),
+  );
+});
+
+Deno.test("tailnetIp must be an IPv4 literal", () => {
+  assertRejects(() =>
+    Promise.resolve().then(() =>
+      model.globalArguments.parse({
+        host: "192.0.2.10",
+        password: "x",
+        tailnetIp: "kvm1.example.ts.net",
+      })
+    )
+  );
 });
