@@ -38,7 +38,7 @@ success for a press wired to nothing.
 
 | Method       | Writes?           | What it does                                                         |
 | ------------ | ----------------- | -------------------------------------------------------------------- |
-| `health`     | no                | Reachability, auth, firmware currency, HDMI signal, HID, MSD, posture |
+| `health`     | no                | Reachability, auth, firmware, HDMI, HID, MSD, Tailscale, posture      |
 | `screenshot` | no                | JPEG of the target's screen, stored as the `screenshot` file          |
 | `atx`        | **with `apply`**  | Power state, or power/reset buttons; refuses without an ATX board     |
 | `msd`        | **with `apply`**  | List, upload, download, attach, detach and remove virtual media       |
@@ -68,9 +68,26 @@ list of `findings`. An unreachable device or a rejected password is recorded as
 | `webterm_enabled`           | info (warn strict) | The browser web terminal (a root shell) is on                |
 | `tls_untrusted`             | info (warn strict) | Self-signed, expired, or not naming the host                 |
 | `atx_absent`                | info               | No ATX board, so power state and control are unavailable     |
+| `tailscale_unreachable`     | warn               | With `tailnetIp`: the web UI did not answer on that address  |
+| `tailscale_ip_changed`      | warn               | With `tailnetIp`: the device reports a different tailnet IP  |
+| `tailscale_not_running`     | warn               | Tailscale is enabled, but tailscaled is not running          |
+| `tailscale_not_connected`   | warn               | tailscaled is in a state other than `Running` (e.g. logged out) |
+| `tailscale_disabled`        | info (warn with `tailnetIp`) | Tailscale is turned off on the device              |
 
 Posture findings are `info` by default because every factory-fresh device has
 them. Pass `strictSecurity: true` to make them count toward the verdict.
+
+**Tailscale.** `health` reads GL.iNet's `GET /api/tailscale/config`, `/status`
+and `/login_status` (firmware without them answers 404, and `tailscale` is then
+recorded as null). It never calls `GET /api/tailscale/login`, which is not
+read-only: it starts a login. The device's own view is not enough on its own: a
+node deleted from the tailnet keeps reporting `Running`, because the device
+cannot tell that its node is gone. Set the `tailnetIp` global argument to have
+`health` also fetch the web UI's login page on that address, which proves the
+path from the tailnet node swamp runs behind. That request is **anonymous**: the
+probe matters most when the pinned address is stale, and then whatever answers
+there is not this KVM, so it must not be sent the password. A re-added node gets a new address, so
+`tailscale_ip_changed` names both and the fix is updating `tailnetIp`.
 
 Arguments: `checkVideo` (default `true`), `checkFirmware` (default `true`; the
 device asks GL.iNet's servers, and a failure there is logged, not counted),
@@ -144,6 +161,7 @@ name: kvm-a
 globalArguments:
   host: 192.0.2.10          # prefer the LAN IP
   password: ${{ vault.get(my-1password, "kvm-a/password") }}
+  tailnetIp: 198.51.100.7   # optional: probe the Tailscale path too
 ```
 
 Use the device's **IP address** when swamp runs in a container. A short name can
@@ -159,7 +177,7 @@ or don't use this model.
 
 ## Scheduling
 
-`health` is cheap: about ten GET requests and a viewer session of a second or
+`health` is cheap: about a dozen GET requests and a viewer session of a second or
 two. Hourly is reasonable. Alert on `verdict != "ok"` and on the age of the
 latest `health` record, so a check that stops running is noticed too.
 
