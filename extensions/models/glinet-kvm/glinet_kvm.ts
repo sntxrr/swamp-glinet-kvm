@@ -253,6 +253,10 @@ async function runCommand(
   stdin: string,
   timeoutMs: number,
 ): Promise<{ code: number; stdout: Uint8Array; stderr: string }> {
+  // Only `curl` and `openssl`, with argv built from schema-validated globals
+  // and credentials on stdin: the device's expired self-signed certificate
+  // rules out Deno's fetch, and there is no swamp primitive for it (README).
+  // swamp-quality-ignore deno-command
   const child = new Deno.Command(cmd, {
     args,
     stdin: "piped",
@@ -332,6 +336,8 @@ export class CliTransport implements Transport {
       `${this.g.host}:${this.g.port}`,
     ];
     if (!isIpLiteral(this.g.host)) args.push("-servername", this.g.host);
+    // The viewer websocket needs TLS without verification; see runCommand.
+    // swamp-quality-ignore deno-command
     const child = new Deno.Command("openssl", {
       args,
       stdin: "piped",
