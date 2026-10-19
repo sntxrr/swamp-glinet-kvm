@@ -1653,3 +1653,123 @@ Deno.test("the inline guard still refuses when checks are skipped", async () => 
   );
   assertEquals(fake.posts().length, 0);
 });
+
+// ---------------------------------------------------------------------------
+// Review fixes (2026.10.19.1)
+// ---------------------------------------------------------------------------
+
+Deno.test("msdChange's own guards refuse a disabled or busy MSD with the checks skipped: no POST, a refused record", async () => {
+  for (
+    const [msd, msg] of [
+      [{ enabled: false, busy: false }, "disabled"],
+      [{ enabled: true, busy: true }, "already in progress"],
+    ] as const
+  ) {
+    const fake = new FakeKvm(healthyRoutes({ "GET /api/msd": ok(msd) }));
+    const { context, getWrittenResources } = ctx();
+    await assertRejects(
+      () =>
+        withFake(fake, () =>
+          model.methods.msdChange.execute(
+            parseArgs("msdChange", { action: "disconnect" }),
+            context as any,
+          )),
+      Error,
+      msg,
+    );
+    assertEquals(fake.posts().length, 0, msg);
+    assertEquals(getWrittenResources()[0].data.outcome, "refused", msg);
+  }
+});
+
+Deno.test("the check read cache: separate per host and password, expires, never holds the password", async () => {
+  const fake = new FakeKvm(healthyRoutes({ "GET /api/atx": ATX_BOARD }));
+  checkReadCache.clear();
+  const run = (globals: Record<string, unknown>) =>
+    withFake(
+      fake,
+      () => model.checks["atx-board-present"].execute({ globalArgs: globals }),
+    );
+  await run({ host: "192.0.2.10", password: "right" });
+  await run({ host: "192.0.2.10", password: "wrong" });
+  await run({ host: "192.0.2.11", password: "right" });
+  assertEquals(
+    fake.calls.length,
+    3,
+    "password and host each get their own read",
+  );
+  await run({ host: "192.0.2.10", password: "right" });
+  assertEquals(fake.calls.length, 3, "same settings within the TTL: cached");
+  const ttl = checkReadCache.ttlMs;
+  checkReadCache.ttlMs = 0;
+  try {
+    await run({ host: "192.0.2.10", password: "right" });
+  } finally {
+    checkReadCache.ttlMs = ttl;
+  }
+  assertEquals(fake.calls.length, 4, "expired: read again");
+  assert(![...checkReadCache.entries.keys()].some((k) => k.includes("right")));
+});
+
+Deno.test("a refusing reading is not cached, so a retry reads the device again", async () => {
+  const fake = new FakeKvm(
+    healthyRoutes({ "GET /api/atx": ok({ enabled: true, busy: true }) }),
+  );
+  checkReadCache.clear();
+  const run = () =>
+    withFake(
+      fake,
+      () =>
+        model.checks["atx-not-busy"].execute({
+          globalArgs: { host: "192.0.2.10", password: "x" },
+        }),
+    );
+  assertEquals((await run()).pass, false);
+  assertEquals((await run()).pass, false);
+  assertEquals(fake.calls.length, 2);
+});
+
+Deno.test("a check reports invalid global arguments as such", async () => {
+  checkReadCache.clear();
+  const r = await model.checks["msd-enabled"].execute({
+    globalArgs: { host: "192.0.2.10" },
+  });
+  assertEquals(r.pass, false);
+  assertStringIncludes(r.errors![0], "invalid global arguments");
+});
+
+Deno.test("msdChange download never records or logs the credentials in its URL", async () => {
+  const fake = new FakeKvm(
+    healthyRoutes({ "POST /api/msd/write_remote": ok({}) }),
+  );
+  const { context, getWrittenResources, getLogs } = ctx() as any;
+  await withFake(
+    fake,
+    () =>
+      model.methods.msdChange.execute(
+        parseArgs("msdChange", {
+          action: "download",
+          image: "x.iso",
+          url: "https://u:secretpw@iso.example.com/x.iso?sig=abc",
+        }),
+        context as any,
+      ),
+  );
+  assertEquals(fake.posts().length, 1, "the download was sent");
+  const [w] = getWrittenResources();
+  assertEquals(w.data.outcome, "done");
+  for (
+    const [what, text] of [["record", JSON.stringify(w.data)], [
+      "logs",
+      JSON.stringify(getLogs()),
+    ]]
+  ) {
+    assert(!text.includes("secretpw"), what);
+    assert(!text.includes("sig=abc"), what);
+  }
+  assertStringIncludes(
+    JSON.stringify(getLogs()),
+    "iso.example.com",
+    "the log still names the host",
+  );
+});

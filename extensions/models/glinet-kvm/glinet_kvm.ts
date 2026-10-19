@@ -30,8 +30,10 @@
  * `off` as a power state, and refuses to "press" a button that is not wired to
  * anything rather than reporting success for a no-op.
  *
- * Every method that changes device state defaults to a dry run; pass
- * `apply: true` to act.
+ * Reads and writes are separate methods. `health`, `screenshot`, `atx` and
+ * `msd` never change the device (`atx` and `msd` report state or record the
+ * plan for a change); `atxPress` and `msdChange` always act, after their
+ * labeled `live` pre-flight checks.
  *
  * @module
  */
@@ -1064,18 +1066,42 @@ async function apiCheck(
   path: string,
   judge: (j: Json) => string | null,
 ): Promise<{ pass: boolean; errors?: string[] }> {
+  let g: GlobalArgs;
+  try {
+    g = GlobalArgsSchema.parse(rawGlobals);
+  } catch (e) {
+    return {
+      pass: false,
+      errors: [`invalid global arguments: ${(e as Error).message}`],
+    };
+  }
+  // The key covers every login setting. The password goes in as a short,
+  // non-reversible fingerprint, so a cache entry never holds it.
+  const pw = Array.from(
+    new Uint8Array(
+      await crypto.subtle.digest(
+        "SHA-256",
+        new TextEncoder().encode(g.password),
+      ),
+    ),
+  ).slice(0, 6).map((b) => b.toString(16).padStart(2, "0")).join("");
+  const key = JSON.stringify([g.host, g.port, g.username, pw, path]);
+  const forget = (p: Promise<Json>) => {
+    // Only our own entry: a newer read may have replaced it since.
+    if (checkReadCache.entries.get(key)?.p === p) {
+      checkReadCache.entries.delete(key);
+    }
+  };
+  const hit = checkReadCache.entries.get(key);
+  let p: Promise<Json>;
+  if (hit && Date.now() - hit.at < checkReadCache.ttlMs) p = hit.p;
+  else {
+    p = getJson(transportFactory.create(g), path);
+    checkReadCache.entries.set(key, { at: Date.now(), p });
+    p.catch(() => forget(p));
+  }
   let j: Json;
   try {
-    const g = GlobalArgsSchema.parse(rawGlobals);
-    const key = `${g.host}:${g.port}:${g.username}:${path}`;
-    const hit = checkReadCache.entries.get(key);
-    let p: Promise<Json>;
-    if (hit && Date.now() - hit.at < checkReadCache.ttlMs) p = hit.p;
-    else {
-      p = getJson(transportFactory.create(g), path);
-      checkReadCache.entries.set(key, { at: Date.now(), p });
-      p.catch(() => checkReadCache.entries.delete(key));
-    }
     j = await p;
   } catch (e) {
     return {
@@ -1084,6 +1110,9 @@ async function apiCheck(
     };
   }
   const why = judge(j);
+  // A refusing reading is not kept: a retry after the device frees up must
+  // read it again.
+  if (why) forget(p);
   return why ? { pass: false, errors: [why] } : { pass: true };
 }
 
@@ -1442,7 +1471,7 @@ export const model = {
     {
       toVersion: "2026.10.19.1",
       description:
-        "No argument change. BREAKING for callers: button presses moved to atxPress and virtual-media changes to msdChange, behind labeled live pre-flight checks; atx and msd are read-only and refuse apply: true.",
+        "No global-argument change. BREAKING for callers: button presses moved to atxPress and virtual-media changes to msdChange, behind labeled live pre-flight checks; atx and msd are read-only and refuse apply: true.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
   ],

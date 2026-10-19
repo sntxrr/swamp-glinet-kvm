@@ -15,8 +15,10 @@ instance.
 | ------------ | ---------------- | --------------------------------------------------------------------- |
 | `health`     | no               | Reachability, firmware currency, HDMI signal, HID, media, posture     |
 | `screenshot` | no               | JPEG of the target's screen                                           |
-| `atx`        | **with `apply`** | Power and reset buttons; refuses when no ATX board is attached        |
-| `msd`        | **with `apply`** | Upload, download, attach, detach and remove virtual media             |
+| `atx`        | no               | Power state, or the plan for a button press                           |
+| `atxPress`   | **always**       | Power and reset buttons; refuses when no ATX board is attached        |
+| `msd`        | no               | Virtual media state, or the plan for a change                         |
+| `msdChange`  | **always**       | Upload, download, attach, detach and remove virtual media             |
 
 The firmware is a fork of PiKVM's `kvmd`, and three of its behaviours make a
 naive client report the wrong thing. The factory TLS certificate expired in

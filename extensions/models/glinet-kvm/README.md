@@ -65,7 +65,10 @@ scoped to them alone (swamp runs an unscoped check before every method):
 Checks of the same endpoint share one read, and a check that cannot read the
 device fails rather than passes. The methods enforce the same conditions
 themselves, so `--skip-check-label live` only skips the early answer, never
-the guard. Refusals that depend on the arguments (image required, file
+the guard. A refusal by a check leaves no `atx` or `msd` record (checks
+cannot write data): the check's error is its only trace, and the latest record
+still shows the previous outcome. Run `atx` or `msd` with the same arguments to
+record the refusal as a plan. Refusals that depend on the arguments (image required, file
 readable, image exists, drive function off) stay in the method: checks see
 the arguments only unvalidated.
 
@@ -146,7 +149,8 @@ swamp data get kvm-a screenshot --json | jq -r .contentPath
 
 ### `atx` and `atxPress`
 
-`action` is one of `status` (default; `atx` only), `on`, `off`, `off_hard`, `reset_hard`,
+`action` is one of `status` (default;
+`atx` only), `on`, `off`, `off_hard`, `reset_hard`,
 `click_power`, `click_power_long`, `click_reset`. `on` and `off` are kvmd's
 "soft" actions: they press power only if the state differs. The `click_*`
 actions press regardless.
