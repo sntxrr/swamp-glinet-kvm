@@ -1019,6 +1019,394 @@ type AtxAction = keyof typeof ATX_ACTIONS;
  */
 export const msdSettle = { timeoutMs: 15000, intervalMs: 500 };
 
+/** Why a button press must not start, from `/api/atx`; null when it may. Pure. */
+export function atxBoardRefusal(atx: Json): string | null {
+  return atx?.enabled
+    ? null
+    : "no ATX board is attached, so the press would do nothing";
+}
+
+/** See atxBoardRefusal. */
+export function atxBusyRefusal(atx: Json): string | null {
+  return atx?.busy ? "an ATX operation is already in progress" : null;
+}
+
+/** Why a virtual-media change must not start, from `/api/msd`; null when it may. Pure. */
+export function msdEnabledRefusal(msd: Json): string | null {
+  return summariseMsd(msd).enabled
+    ? null
+    : "virtual media is disabled on this device";
+}
+
+/** See msdEnabledRefusal. */
+export function msdBusyRefusal(msd: Json): string | null {
+  return summariseMsd(msd).busy
+    ? "an MSD operation is already in progress"
+    : null;
+}
+
+/**
+ * Checks that read the same endpoint run back to back, so one read serves
+ * them; a short TTL keeps a later run from judging a stale one. A failed
+ * read is not cached. Exported for tests.
+ */
+export const checkReadCache = {
+  ttlMs: 30000,
+  entries: new Map<string, { at: number; p: Promise<Json> }>(),
+  clear() {
+    this.entries.clear();
+  },
+};
+
+/** Run a check over one API read: judge it, and fail closed when the read fails. */
+async function apiCheck(
+  rawGlobals: unknown,
+  path: string,
+  judge: (j: Json) => string | null,
+): Promise<{ pass: boolean; errors?: string[] }> {
+  let j: Json;
+  try {
+    const g = GlobalArgsSchema.parse(rawGlobals);
+    const key = `${g.host}:${g.port}:${g.username}:${path}`;
+    const hit = checkReadCache.entries.get(key);
+    let p: Promise<Json>;
+    if (hit && Date.now() - hit.at < checkReadCache.ttlMs) p = hit.p;
+    else {
+      p = getJson(transportFactory.create(g), path);
+      checkReadCache.entries.set(key, { at: Date.now(), p });
+      p.catch(() => checkReadCache.entries.delete(key));
+    }
+    j = await p;
+  } catch (e) {
+    return {
+      pass: false,
+      errors: [`could not read ${path}: ${(e as Error).message}`],
+    };
+  }
+  const why = judge(j);
+  return why ? { pass: false, errors: [why] } : { pass: true };
+}
+
+/** The body of `atx` (status or plan) and `atxPress` (act). */
+async function runAtx(
+  args: { action: "status" | AtxAction; apply: boolean },
+  context: Ctx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = context.globalArgs;
+  const t = transportFactory.create(g);
+  const before: Json = await getJson(t, "/api/atx");
+  const enabled = Boolean(before?.enabled);
+  const powerOf = (
+    s: Json,
+  ): string | null => (s?.enabled ? s.power ?? null : null);
+  const base = {
+    host: g.host,
+    at: new Date().toISOString(),
+    action: args.action,
+    enabled,
+    powerBefore: powerOf(before),
+  };
+  const write = (rec: Record<string, unknown>) =>
+    context.writeResource("atx", "atx", { ...base, ...rec });
+
+  if (args.action === "status") {
+    const h = await write({
+      applied: false,
+      outcome: "status",
+      message: enabled
+        ? `power is ${before.power}`
+        : "no ATX board: power state unknown",
+      powerAfter: powerOf(before),
+    });
+    return { dataHandles: [h] };
+  }
+  if (!enabled) {
+    await write({
+      applied: false,
+      outcome: "refused",
+      message:
+        `refused ${args.action}: no ATX board is attached, so the press would do nothing`,
+      powerAfter: null,
+    });
+    throw new Error(
+      `${g.host} has no ATX board; refusing ${args.action}`,
+    );
+  }
+  if (before?.busy) {
+    await write({
+      applied: false,
+      outcome: "refused",
+      message: "refused: an ATX operation is already in progress",
+      powerAfter: powerOf(before),
+    });
+    throw new Error(`${g.host} ATX is busy`);
+  }
+  const op = ATX_ACTIONS[args.action];
+  if (!args.apply) {
+    const h = await write({
+      applied: false,
+      outcome: "dry-run",
+      message: `would POST ${op.path}?${new URLSearchParams(
+        op.query,
+      )} (power is ${before.power}); call atxPress to act`,
+      powerAfter: powerOf(before),
+    });
+    return { dataHandles: [h] };
+  }
+  context.logger.warn("ATX {action} on {host}", {
+    action: args.action,
+    host: g.host,
+  });
+  await postJson(t, op.path, { ...op.query, wait: "1" });
+  const after: Json = await getJson(t, "/api/atx");
+  const h = await write({
+    applied: true,
+    outcome: "done",
+    message:
+      `${args.action} sent; power was ${before.power}, now ${after?.power}`,
+    powerAfter: powerOf(after),
+  });
+  return { dataHandles: [h] };
+}
+
+type MsdAction = "upload" | "download" | "connect" | "disconnect" | "remove";
+
+interface MsdRunArgs {
+  action: "status" | MsdAction;
+  image?: string;
+  file?: string;
+  url?: string;
+  cdrom: boolean;
+  transferTimeoutMs: number;
+  apply: boolean;
+}
+
+/** The body of `msd` (status or plan) and `msdChange` (act). */
+async function runMsd(
+  args: MsdRunArgs,
+  context: Ctx,
+): Promise<{ dataHandles: unknown[] }> {
+  const g = context.globalArgs;
+  const t = transportFactory.create(g);
+  const state = summariseMsd(await getJson(t, "/api/msd"));
+  const gadget = await readGadget(t);
+  const record = (
+    s: ReturnType<typeof summariseMsd>,
+    rec: { applied: boolean; outcome: string; message: string },
+  ) =>
+    context.writeResource("msd", "msd", {
+      host: g.host,
+      at: new Date().toISOString(),
+      action: args.action,
+      ...rec,
+      enabled: s.enabled,
+      connected: s.connected,
+      image: s.image,
+      cdrom: s.cdrom,
+      images: s.images,
+      freeBytes: s.freeBytes,
+      gadgetCdrom: gadget.cdrom,
+      gadgetFlash: gadget.flash,
+    });
+  const refuse = async (why: string): Promise<never> => {
+    await record(state, {
+      applied: false,
+      outcome: "refused",
+      message: why,
+    });
+    throw new Error(`msd ${args.action} on ${g.host}: ${why}`);
+  };
+
+  if (args.action === "status") {
+    const h = await record(state, {
+      applied: false,
+      outcome: "status",
+      message: state.connected
+        ? `attached: ${state.image ?? "(unnamed)"}` +
+          (driveInvisible(gadget, state.cdrom)
+            ? " (not presented: USB mass-storage function is off)"
+            : "")
+        : `${state.images.length} image(s), nothing attached`,
+    });
+    return { dataHandles: [h] };
+  }
+
+  if (!state.enabled) {
+    await refuse("virtual media is disabled on this device");
+  }
+  if (state.busy) await refuse("an MSD operation is already in progress");
+  const needsImage = ["upload", "download", "connect", "remove"].includes(
+    args.action,
+  );
+  if (needsImage && !args.image) await refuse("`image` is required");
+  const name = args.image ?? "";
+  const exists = state.images.some((i) => i.name === name);
+
+  let plan: {
+    path: string;
+    query: Record<string, string>;
+    opts?: RequestOptions;
+  }[] = [];
+  switch (args.action) {
+    case "upload": {
+      if (!args.file) await refuse("`file` is required for upload");
+      const st = await Deno.stat(args.file!).catch(() => null);
+      if (!st?.isFile) {
+        await refuse(`${args.file} is not a readable file`);
+      }
+      if (exists) {
+        await refuse(`image ${name} already exists; remove it first`);
+      }
+      if (state.freeBytes !== null && st!.size > state.freeBytes) {
+        await refuse(
+          `${st!.size} bytes will not fit in ${state.freeBytes} free`,
+        );
+      }
+      plan = [{
+        path: "/api/msd/write",
+        query: { image: name, remove_incomplete: "1" },
+        opts: {
+          uploadFile: args.file,
+          timeoutMs: args.transferTimeoutMs,
+        },
+      }];
+      break;
+    }
+    case "download":
+      if (!args.url) await refuse("`url` is required for download");
+      if (exists) {
+        await refuse(`image ${name} already exists; remove it first`);
+      }
+      plan = [{
+        path: "/api/msd/write_remote",
+        query: { url: args.url!, image: name, remove_incomplete: "1" },
+        opts: { timeoutMs: args.transferTimeoutMs },
+      }];
+      break;
+    case "connect":
+      if (!exists) await refuse(`no image named ${name} on the device`);
+      if (driveInvisible(gadget, args.cdrom)) {
+        // kvmd would accept this and report connected=true while the
+        // target sees nothing. Refuse rather than report a false success.
+        await refuse(
+          `the KVM's USB ${
+            args.cdrom ? "CD-ROM" : "flash-drive"
+          } function is disabled (${
+            args.cdrom ? "start_cdrom" : "start_flash"
+          }=false), so the target would not see the image; enable it in the KVM's USB device settings first`,
+        );
+      }
+      if (state.connected) {
+        await refuse(
+          `${state.image ?? "an image"} is already attached; disconnect first`,
+        );
+      }
+      plan = [
+        {
+          path: "/api/msd/set_params",
+          query: { image: name, cdrom: args.cdrom ? "1" : "0" },
+        },
+        { path: "/api/msd/set_connected", query: { connected: "1" } },
+      ];
+      break;
+    case "disconnect":
+      if (!state.connected) {
+        // Already in the requested state: report it, do not fail.
+        const h = await record(state, {
+          applied: false,
+          outcome: "done",
+          message: "nothing is attached; nothing to do",
+        });
+        return { dataHandles: [h] };
+      }
+      plan = [{
+        path: "/api/msd/set_connected",
+        query: { connected: "0" },
+      }];
+      break;
+    case "remove":
+      if (!exists) {
+        const h = await record(state, {
+          applied: false,
+          outcome: "done",
+          message: `no image named ${name} on the device; nothing to do`,
+        });
+        return { dataHandles: [h] };
+      }
+      if (state.connected && state.image === name) {
+        await refuse(
+          `${name} is attached to the target; disconnect first`,
+        );
+      }
+      plan = [{ path: "/api/msd/remove", query: { image: name } }];
+      break;
+  }
+
+  // A download URL can carry credentials (user:pass@ or a signed query);
+  // the plan is logged and stored, so it shows only scheme, host and path.
+  const describe = plan.map((p) => {
+    const q = { ...p.query };
+    if (q.url) q.url = redactUrl(q.url);
+    return `POST ${p.path}?${new URLSearchParams(q)}`;
+  })
+    .join(", then ");
+  if (!args.apply) {
+    const h = await record(state, {
+      applied: false,
+      outcome: "dry-run",
+      message: `would ${describe}; call msdChange to act`,
+    });
+    return { dataHandles: [h] };
+  }
+  context.logger.warn("MSD {action} on {host}: {plan}", {
+    action: args.action,
+    host: g.host,
+    plan: describe,
+  });
+  for (const p of plan) await postJson(t, p.path, p.query, p.opts);
+
+  // kvmd applies storage changes asynchronously: read straight after a
+  // remove and the image is still listed. Poll until the device shows the
+  // change, so the record describes the device rather than a stale read.
+  const settled = (m: ReturnType<typeof summariseMsd>): boolean => {
+    const has = m.images.some((i) => i.name === name);
+    switch (args.action) {
+      case "upload":
+      case "download":
+        return has && !m.busy;
+      case "connect":
+        return m.connected && m.image === name;
+      case "disconnect":
+        return !m.connected;
+      case "remove":
+        return !has && !m.busy;
+    }
+    return true;
+  };
+  let after = summariseMsd(await getJson(t, "/api/msd"));
+  const until = Date.now() + msdSettle.timeoutMs;
+  while (!settled(after) && Date.now() < until) {
+    await sleep(msdSettle.intervalMs);
+    after = summariseMsd(await getJson(t, "/api/msd"));
+  }
+  const ok = settled(after);
+  if (!ok) {
+    context.logger.warn(
+      "MSD {action} on {host}: calls succeeded but the device has not shown the change after {ms}ms",
+      { action: args.action, host: g.host, ms: msdSettle.timeoutMs },
+    );
+  }
+  const h = await record(after, {
+    applied: true,
+    outcome: "done",
+    message: `${args.action} done: ${describe}` +
+      (ok
+        ? ""
+        : ` (device state not yet updated after ${msdSettle.timeoutMs}ms)`),
+  });
+  return { dataHandles: [h] };
+}
+
 // ---------------------------------------------------------------------------
 // Model
 // ---------------------------------------------------------------------------
@@ -1029,7 +1417,7 @@ export const msdSettle = { timeoutMs: 15000, intervalMs: 500 };
  */
 export const model = {
   type: "@sntxrr/glinet-kvm",
-  version: "2026.10.18.2",
+  version: "2026.10.19.1",
   globalArguments: GlobalArgsSchema,
 
   upgrades: [
@@ -1051,7 +1439,51 @@ export const model = {
         "No argument change. Review fixes: the tailnet probe proves identity (kvmd's anonymous 401 and the LAN certificate) and records tailnetSameDevice; curl ignores ~/.curlrc and proxies; msd disconnect/remove are idempotent; download URLs are redacted.",
       upgradeAttributes: (old: Record<string, unknown>) => old,
     },
+    {
+      toVersion: "2026.10.19.1",
+      description:
+        "No argument change. BREAKING for callers: button presses moved to atxPress and virtual-media changes to msdChange, behind labeled live pre-flight checks; atx and msd are read-only and refuse apply: true.",
+      upgradeAttributes: (old: Record<string, unknown>) => old,
+    },
   ],
+
+  // Scoped with appliesTo: swamp runs an unscoped check before EVERY method
+  // (measured on swamp 20261017), which would put API reads in front of
+  // health and the read-only methods. Checks receive vault-resolved globals
+  // (measured), so they authenticate like the methods do. Each method repeats
+  // its guard, so --skip-check-label live skips the early answer, never the
+  // protection.
+  checks: {
+    "atx-board-present": {
+      description:
+        "An ATX board is attached; without one kvmd accepts a press and nothing happens.",
+      labels: ["live"],
+      appliesTo: ["atxPress"],
+      execute: (context: { globalArgs: unknown }) =>
+        apiCheck(context.globalArgs, "/api/atx", atxBoardRefusal),
+    },
+    "atx-not-busy": {
+      description: "No ATX operation is already in progress.",
+      labels: ["live"],
+      appliesTo: ["atxPress"],
+      execute: (context: { globalArgs: unknown }) =>
+        apiCheck(context.globalArgs, "/api/atx", atxBusyRefusal),
+    },
+    "msd-enabled": {
+      description: "Virtual media is enabled on the device.",
+      labels: ["live"],
+      appliesTo: ["msdChange"],
+      execute: (context: { globalArgs: unknown }) =>
+        apiCheck(context.globalArgs, "/api/msd", msdEnabledRefusal),
+    },
+    "msd-not-busy": {
+      description: "No virtual-media operation is already in progress.",
+      labels: ["live"],
+      appliesTo: ["msdChange"],
+      execute: (context: { globalArgs: unknown }) =>
+        apiCheck(context.globalArgs, "/api/msd", msdBusyRefusal),
+    },
+  },
 
   resources: {
     health: {
@@ -1511,7 +1943,7 @@ export const model = {
 
     atx: {
       description:
-        "Read ATX state or drive the target's power/reset buttons. Dry run unless apply is true. Refuses any button action when the KVM has no ATX board, since kvmd would accept it and nothing would happen.",
+        "Read-only: report ATX power state (action status), or plan a button action and record what it would do, including any refusal. Never presses anything; atxPress does. Since 2026.10.19.1 `apply: true` is refused here rather than ignored, so a caller written for the old method fails loudly instead of silently becoming a dry run.",
       arguments: z.object({
         action: z.enum([
           "status",
@@ -1526,94 +1958,48 @@ export const model = {
           "on/off are soft (power button, only if state differs); off_hard holds power; reset_hard pulses reset; click_* press a button unconditionally.",
         ),
         apply: z.boolean().default(false).describe(
-          "Actually press the button. Without it, report what would happen.",
+          "Removed in 2026.10.19.1: true is refused. Use atxPress.",
         ),
       }),
       execute: async (
         args: { action: "status" | AtxAction; apply: boolean },
         context: Ctx,
       ): Promise<{ dataHandles: unknown[] }> => {
-        const g = context.globalArgs;
-        const t = transportFactory.create(g);
-        const before: Json = await getJson(t, "/api/atx");
-        const enabled = Boolean(before?.enabled);
-        const powerOf = (
-          s: Json,
-        ): string | null => (s?.enabled ? s.power ?? null : null);
-        const base = {
-          host: g.host,
-          at: new Date().toISOString(),
-          action: args.action,
-          enabled,
-          powerBefore: powerOf(before),
-        };
-        const write = (rec: Record<string, unknown>) =>
-          context.writeResource("atx", "atx", { ...base, ...rec });
-
-        if (args.action === "status") {
-          const h = await write({
-            applied: false,
-            outcome: "status",
-            message: enabled
-              ? `power is ${before.power}`
-              : "no ATX board: power state unknown",
-            powerAfter: powerOf(before),
-          });
-          return { dataHandles: [h] };
-        }
-        if (!enabled) {
-          await write({
-            applied: false,
-            outcome: "refused",
-            message:
-              `refused ${args.action}: no ATX board is attached, so the press would do nothing`,
-            powerAfter: null,
-          });
+        if (args.apply) {
           throw new Error(
-            `${g.host} has no ATX board; refusing ${args.action}`,
+            "atx is read-only since @sntxrr/glinet-kvm 2026.10.19.1: apply: true is refused, nothing was pressed. Call atxPress.",
           );
         }
-        if (before?.busy) {
-          await write({
-            applied: false,
-            outcome: "refused",
-            message: "refused: an ATX operation is already in progress",
-            powerAfter: powerOf(before),
-          });
-          throw new Error(`${g.host} ATX is busy`);
-        }
-        const op = ATX_ACTIONS[args.action];
-        if (!args.apply) {
-          const h = await write({
-            applied: false,
-            outcome: "dry-run",
-            message: `would POST ${op.path}?${new URLSearchParams(
-              op.query,
-            )} (power is ${before.power}); pass apply: true to act`,
-            powerAfter: powerOf(before),
-          });
-          return { dataHandles: [h] };
-        }
-        context.logger.warn("ATX {action} on {host}", {
-          action: args.action,
-          host: g.host,
-        });
-        await postJson(t, op.path, { ...op.query, wait: "1" });
-        const after: Json = await getJson(t, "/api/atx");
-        const h = await write({
-          applied: true,
-          outcome: "done",
-          message:
-            `${args.action} sent; power was ${before.power}, now ${after?.power}`,
-          powerAfter: powerOf(after),
-        });
-        return { dataHandles: [h] };
+        return await runAtx({ ...args, apply: false }, context);
       },
+    },
+
+    atxPress: {
+      description:
+        "Drive the target's power/reset buttons. Always acts; plan first with `atx`. The labeled `live` pre-flight checks (ATX board present, not busy) run first; the method enforces the same conditions itself, since kvmd would accept a press with no board attached and nothing would happen.",
+      arguments: z.object({
+        action: z.enum([
+          "on",
+          "off",
+          "off_hard",
+          "reset_hard",
+          "click_power",
+          "click_power_long",
+          "click_reset",
+        ]).describe(
+          "on/off are soft (power button, only if state differs); off_hard holds power; reset_hard pulses reset; click_* press a button unconditionally.",
+        ),
+      }),
+      execute: async (
+        args: { action: AtxAction },
+        context: Ctx,
+      ): Promise<{ dataHandles: unknown[] }> =>
+        await runAtx({ ...args, apply: true }, context),
     },
 
     msd: {
       description:
-        "Virtual media (mass storage). status lists images and what is attached; upload streams a local ISO to the KVM; download has the KVM fetch a URL itself; connect attaches an image to the target as a CD-ROM or flash drive; disconnect detaches; remove deletes an image. Every action but status is a dry run unless apply is true.",
+        "Read-only virtual media (mass storage): status lists images and what is attached; any other action records the plan for msdChange with the same arguments, including any refusal. Never changes the device. Since 2026.10.19.1 `apply: true` is refused here rather than ignored.",
       arguments: z.object({
         action: z.enum([
           "status",
@@ -1641,249 +2027,55 @@ export const model = {
             "Timeout for upload and download.",
           ),
         apply: z.boolean().default(false).describe(
-          "Actually change the device. Without it, report what would happen.",
+          "Removed in 2026.10.19.1: true is refused. Use msdChange.",
         ),
       }),
       execute: async (
-        args: {
-          action:
-            | "status"
-            | "upload"
-            | "download"
-            | "connect"
-            | "disconnect"
-            | "remove";
-          image?: string;
-          file?: string;
-          url?: string;
-          cdrom: boolean;
-          transferTimeoutMs: number;
-          apply: boolean;
-        },
+        args: MsdRunArgs,
         context: Ctx,
       ): Promise<{ dataHandles: unknown[] }> => {
-        const g = context.globalArgs;
-        const t = transportFactory.create(g);
-        const state = summariseMsd(await getJson(t, "/api/msd"));
-        const gadget = await readGadget(t);
-        const record = (
-          s: ReturnType<typeof summariseMsd>,
-          rec: { applied: boolean; outcome: string; message: string },
-        ) =>
-          context.writeResource("msd", "msd", {
-            host: g.host,
-            at: new Date().toISOString(),
-            action: args.action,
-            ...rec,
-            enabled: s.enabled,
-            connected: s.connected,
-            image: s.image,
-            cdrom: s.cdrom,
-            images: s.images,
-            freeBytes: s.freeBytes,
-            gadgetCdrom: gadget.cdrom,
-            gadgetFlash: gadget.flash,
-          });
-        const refuse = async (why: string): Promise<never> => {
-          await record(state, {
-            applied: false,
-            outcome: "refused",
-            message: why,
-          });
-          throw new Error(`msd ${args.action} on ${g.host}: ${why}`);
-        };
-
-        if (args.action === "status") {
-          const h = await record(state, {
-            applied: false,
-            outcome: "status",
-            message: state.connected
-              ? `attached: ${state.image ?? "(unnamed)"}` +
-                (driveInvisible(gadget, state.cdrom)
-                  ? " (not presented: USB mass-storage function is off)"
-                  : "")
-              : `${state.images.length} image(s), nothing attached`,
-          });
-          return { dataHandles: [h] };
-        }
-
-        if (!state.enabled) {
-          await refuse("virtual media is disabled on this device");
-        }
-        if (state.busy) await refuse("an MSD operation is already in progress");
-        const needsImage = ["upload", "download", "connect", "remove"].includes(
-          args.action,
-        );
-        if (needsImage && !args.image) await refuse("`image` is required");
-        const name = args.image ?? "";
-        const exists = state.images.some((i) => i.name === name);
-
-        let plan: {
-          path: string;
-          query: Record<string, string>;
-          opts?: RequestOptions;
-        }[] = [];
-        switch (args.action) {
-          case "upload": {
-            if (!args.file) await refuse("`file` is required for upload");
-            const st = await Deno.stat(args.file!).catch(() => null);
-            if (!st?.isFile) {
-              await refuse(`${args.file} is not a readable file`);
-            }
-            if (exists) {
-              await refuse(`image ${name} already exists; remove it first`);
-            }
-            if (state.freeBytes !== null && st!.size > state.freeBytes) {
-              await refuse(
-                `${st!.size} bytes will not fit in ${state.freeBytes} free`,
-              );
-            }
-            plan = [{
-              path: "/api/msd/write",
-              query: { image: name, remove_incomplete: "1" },
-              opts: {
-                uploadFile: args.file,
-                timeoutMs: args.transferTimeoutMs,
-              },
-            }];
-            break;
-          }
-          case "download":
-            if (!args.url) await refuse("`url` is required for download");
-            if (exists) {
-              await refuse(`image ${name} already exists; remove it first`);
-            }
-            plan = [{
-              path: "/api/msd/write_remote",
-              query: { url: args.url!, image: name, remove_incomplete: "1" },
-              opts: { timeoutMs: args.transferTimeoutMs },
-            }];
-            break;
-          case "connect":
-            if (!exists) await refuse(`no image named ${name} on the device`);
-            if (driveInvisible(gadget, args.cdrom)) {
-              // kvmd would accept this and report connected=true while the
-              // target sees nothing. Refuse rather than report a false success.
-              await refuse(
-                `the KVM's USB ${
-                  args.cdrom ? "CD-ROM" : "flash-drive"
-                } function is disabled (${
-                  args.cdrom ? "start_cdrom" : "start_flash"
-                }=false), so the target would not see the image; enable it in the KVM's USB device settings first`,
-              );
-            }
-            if (state.connected) {
-              await refuse(
-                `${
-                  state.image ?? "an image"
-                } is already attached; disconnect first`,
-              );
-            }
-            plan = [
-              {
-                path: "/api/msd/set_params",
-                query: { image: name, cdrom: args.cdrom ? "1" : "0" },
-              },
-              { path: "/api/msd/set_connected", query: { connected: "1" } },
-            ];
-            break;
-          case "disconnect":
-            if (!state.connected) {
-              // Already in the requested state: report it, do not fail.
-              const h = await record(state, {
-                applied: false,
-                outcome: "done",
-                message: "nothing is attached; nothing to do",
-              });
-              return { dataHandles: [h] };
-            }
-            plan = [{
-              path: "/api/msd/set_connected",
-              query: { connected: "0" },
-            }];
-            break;
-          case "remove":
-            if (!exists) {
-              const h = await record(state, {
-                applied: false,
-                outcome: "done",
-                message: `no image named ${name} on the device; nothing to do`,
-              });
-              return { dataHandles: [h] };
-            }
-            if (state.connected && state.image === name) {
-              await refuse(
-                `${name} is attached to the target; disconnect first`,
-              );
-            }
-            plan = [{ path: "/api/msd/remove", query: { image: name } }];
-            break;
-        }
-
-        // A download URL can carry credentials (user:pass@ or a signed query);
-        // the plan is logged and stored, so it shows only scheme, host and path.
-        const describe = plan.map((p) => {
-          const q = { ...p.query };
-          if (q.url) q.url = redactUrl(q.url);
-          return `POST ${p.path}?${new URLSearchParams(q)}`;
-        })
-          .join(", then ");
-        if (!args.apply) {
-          const h = await record(state, {
-            applied: false,
-            outcome: "dry-run",
-            message: `would ${describe}; pass apply: true to act`,
-          });
-          return { dataHandles: [h] };
-        }
-        context.logger.warn("MSD {action} on {host}: {plan}", {
-          action: args.action,
-          host: g.host,
-          plan: describe,
-        });
-        for (const p of plan) await postJson(t, p.path, p.query, p.opts);
-
-        // kvmd applies storage changes asynchronously: read straight after a
-        // remove and the image is still listed. Poll until the device shows the
-        // change, so the record describes the device rather than a stale read.
-        const settled = (m: ReturnType<typeof summariseMsd>): boolean => {
-          const has = m.images.some((i) => i.name === name);
-          switch (args.action) {
-            case "upload":
-            case "download":
-              return has && !m.busy;
-            case "connect":
-              return m.connected && m.image === name;
-            case "disconnect":
-              return !m.connected;
-            case "remove":
-              return !has && !m.busy;
-          }
-          return true;
-        };
-        let after = summariseMsd(await getJson(t, "/api/msd"));
-        const until = Date.now() + msdSettle.timeoutMs;
-        while (!settled(after) && Date.now() < until) {
-          await sleep(msdSettle.intervalMs);
-          after = summariseMsd(await getJson(t, "/api/msd"));
-        }
-        const ok = settled(after);
-        if (!ok) {
-          context.logger.warn(
-            "MSD {action} on {host}: calls succeeded but the device has not shown the change after {ms}ms",
-            { action: args.action, host: g.host, ms: msdSettle.timeoutMs },
+        if (args.apply) {
+          throw new Error(
+            "msd is read-only since @sntxrr/glinet-kvm 2026.10.19.1: apply: true is refused, nothing was changed. Call msdChange.",
           );
         }
-        const h = await record(after, {
-          applied: true,
-          outcome: "done",
-          message: `${args.action} done: ${describe}` +
-            (ok
-              ? ""
-              : ` (device state not yet updated after ${msdSettle.timeoutMs}ms)`),
-        });
-        return { dataHandles: [h] };
+        return await runMsd({ ...args, apply: false }, context);
       },
+    },
+
+    msdChange: {
+      description:
+        "Change virtual media. Always acts; plan first with `msd`. upload streams a local ISO to the KVM; download has the KVM fetch a URL itself; connect attaches an image to the target as a CD-ROM or flash drive; disconnect detaches; remove deletes an image. The labeled `live` pre-flight checks (virtual media enabled, not busy) run first; the method enforces the same conditions itself, plus the ones that depend on the arguments.",
+      arguments: z.object({
+        action: z.enum([
+          "upload",
+          "download",
+          "connect",
+          "disconnect",
+          "remove",
+        ]),
+        image: z.string().optional().describe(
+          "Image name on the KVM. Required for upload, download, connect, remove.",
+        ),
+        file: z.string().optional().describe(
+          "Local path to upload (upload only).",
+        ),
+        url: z.string().url().optional().describe(
+          "URL the KVM downloads itself (download only). Better than upload for large ISOs over a slow link.",
+        ),
+        cdrom: z.boolean().default(true).describe(
+          "connect: present as a CD-ROM (true) or a writable flash drive (false).",
+        ),
+        transferTimeoutMs: z.number().int().positive().default(3_600_000)
+          .describe(
+            "Timeout for upload and download.",
+          ),
+      }),
+      execute: async (
+        args: Omit<MsdRunArgs, "apply">,
+        context: Ctx,
+      ): Promise<{ dataHandles: unknown[] }> =>
+        await runMsd({ ...args, apply: true }, context),
     },
   },
 };

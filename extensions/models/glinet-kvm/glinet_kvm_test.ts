@@ -11,6 +11,7 @@ import { createModelTestContext } from "jsr:@swamp-club/swamp-testing@0.20260928
 import {
   type CertInfo,
   certMatchesHost,
+  checkReadCache,
   CliTransport,
   curlConfig,
   curlQuote,
@@ -740,8 +741,8 @@ Deno.test("atx refuses a button press when there is no board, even with apply", 
   await assertRejects(
     () =>
       withFake(fake, () =>
-        model.methods.atx.execute(
-          parseArgs("atx", { action: "reset_hard", apply: true }),
+        model.methods.atxPress.execute(
+          parseArgs("atxPress", { action: "reset_hard" }),
           context as any,
         )),
     Error,
@@ -772,8 +773,8 @@ Deno.test("atx apply posts the action and waits for it", async () => {
   );
   const { context, getWrittenResources } = ctx();
   await withFake(fake, () =>
-    model.methods.atx.execute(
-      parseArgs("atx", { action: "click_reset", apply: true }),
+    model.methods.atxPress.execute(
+      parseArgs("atxPress", { action: "click_reset" }),
       context as any,
     ));
   assertEquals(fake.posts(), [{
@@ -825,12 +826,11 @@ Deno.test("msd connect apply selects the image, then attaches it", async () => {
   }));
   const { context } = ctx();
   await withFake(fake, () =>
-    model.methods.msd.execute(
-      parseArgs("msd", {
+    model.methods.msdChange.execute(
+      parseArgs("msdChange", {
         action: "connect",
         image: "rescue.iso",
         cdrom: false,
-        apply: true,
       }),
       context as any,
     ));
@@ -868,8 +868,8 @@ Deno.test("msd waits for the device to drop a removed image before recording", a
   }));
   const { context, getWrittenResources } = ctx();
   await withFake(fake, () =>
-    model.methods.msd.execute(
-      parseArgs("msd", { action: "remove", image: "rescue.iso", apply: true }),
+    model.methods.msdChange.execute(
+      parseArgs("msdChange", { action: "remove", image: "rescue.iso" }),
       context as any,
     ));
   const d = getWrittenResources()[0].data;
@@ -885,8 +885,8 @@ Deno.test("msd records, without failing, a change the device never shows", async
   }));
   const { context, getWrittenResources } = ctx();
   await withFake(fake, () =>
-    model.methods.msd.execute(
-      parseArgs("msd", { action: "remove", image: "rescue.iso", apply: true }),
+    model.methods.msdChange.execute(
+      parseArgs("msdChange", { action: "remove", image: "rescue.iso" }),
       context as any,
     ));
   assertStringIncludes(
@@ -916,11 +916,10 @@ Deno.test("msd refuses to connect a CD-ROM the gadget will not present", async (
   await assertRejects(
     () =>
       withFake(fake, () =>
-        model.methods.msd.execute(
-          parseArgs("msd", {
+        model.methods.msdChange.execute(
+          parseArgs("msdChange", {
             action: "connect",
             image: "rescue.iso",
-            apply: true,
           }),
           context as any,
         )),
@@ -968,11 +967,10 @@ Deno.test("msd refuses to remove the image that is attached", async () => {
   await assertRejects(
     () =>
       withFake(fake, () =>
-        model.methods.msd.execute(
-          parseArgs("msd", {
+        model.methods.msdChange.execute(
+          parseArgs("msdChange", {
             action: "remove",
             image: "rescue.iso",
-            apply: true,
           }),
           context as any,
         )),
@@ -989,12 +987,11 @@ Deno.test("msd upload refuses a file that does not exist", async () => {
   await assertRejects(
     () =>
       withFake(fake, () =>
-        model.methods.msd.execute(
-          parseArgs("msd", {
+        model.methods.msdChange.execute(
+          parseArgs("msdChange", {
             action: "upload",
             image: "x.iso",
             file: "/nonexistent/x.iso",
-            apply: true,
           }),
           context as any,
         )),
@@ -1402,15 +1399,19 @@ Deno.test("msd download never records or logs the credentials in its URL", async
 Deno.test("msd disconnect with nothing attached, and remove of a missing image, succeed as no-ops", async () => {
   for (
     const args of [
-      { action: "disconnect", apply: true },
-      { action: "remove", image: "gone.iso", apply: true },
+      { action: "disconnect" },
+      { action: "remove", image: "gone.iso" },
     ]
   ) {
     const fake = new FakeKvm(healthyRoutes());
     const { context, getWrittenResources } = ctx();
     await withFake(
       fake,
-      () => model.methods.msd.execute(parseArgs("msd", args), context as any),
+      () =>
+        model.methods.msdChange.execute(
+          parseArgs("msdChange", args),
+          context as any,
+        ),
     );
     const [w] = getWrittenResources();
     model.resources.msd.schema.parse(w.data);
@@ -1489,4 +1490,166 @@ Deno.test("CliTransport ignores ~/.curlrc, so a 'verbose' there cannot print the
       : Deno.env.set("CURL_HOME", oldCurlHome);
     await Deno.remove(dir, { recursive: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// 2026.10.19.1: reads and writes split; labeled pre-flight checks
+// ---------------------------------------------------------------------------
+
+Deno.test("atx and msd refuse apply: true loudly, before any request", async () => {
+  for (
+    const [m, a] of [
+      ["atx", { action: "click_reset", apply: true }],
+      ["msd", { action: "remove", image: "rescue.iso", apply: true }],
+    ] as const
+  ) {
+    const fake = new FakeKvm(healthyRoutes({ "GET /api/atx": ATX_BOARD }));
+    const { context, getWrittenResources } = ctx();
+    await assertRejects(
+      () =>
+        withFake(
+          fake,
+          () =>
+            (model.methods[m].execute as any)(parseArgs(m, a), context as any),
+        ),
+      Error,
+      m === "atx" ? "atxPress" : "msdChange",
+    );
+    assertEquals(fake.calls.length, 0, m);
+    assertEquals(getWrittenResources().length, 0, m);
+  }
+});
+
+Deno.test("the write methods take no apply and no status action", () => {
+  for (const m of ["atxPress", "msdChange"] as const) {
+    const shape = model.methods[m].arguments.shape as Record<string, any>;
+    assert(!("apply" in shape), m);
+    assert(!shape.action.safeParse("status").success, m);
+  }
+});
+
+Deno.test("plans point at the write method", async () => {
+  const fake = new FakeKvm(healthyRoutes({ "GET /api/atx": ATX_BOARD }));
+  const { context, getWrittenResources } = ctx();
+  await withFake(
+    fake,
+    () =>
+      model.methods.atx.execute(
+        parseArgs("atx", { action: "off" }),
+        context as any,
+      ),
+  );
+  assertStringIncludes(
+    String(getWrittenResources()[0].data.message),
+    "call atxPress",
+  );
+});
+
+Deno.test("every check is labeled live and scoped to its write method only", () => {
+  const scope: Record<string, string[]> = {
+    "atx-board-present": ["atxPress"],
+    "atx-not-busy": ["atxPress"],
+    "msd-enabled": ["msdChange"],
+    "msd-not-busy": ["msdChange"],
+  };
+  assertEquals(Object.keys(model.checks).sort(), Object.keys(scope).sort());
+  for (const [n, c] of Object.entries(model.checks)) {
+    // An unscoped swamp check runs before EVERY method, health included.
+    assertEquals(c.appliesTo, scope[n], n);
+    assert(c.labels.includes("live"), n);
+  }
+});
+
+const runCheck = async (name: keyof typeof model.checks, fake: FakeKvm) => {
+  checkReadCache.clear();
+  return await withFake(fake, () =>
+    model.checks[name].execute({
+      globalArgs: { host: "192.0.2.10", password: "x" },
+    }));
+};
+
+Deno.test("checks pass on a ready device, and checks of one endpoint share one read", async () => {
+  const fake = new FakeKvm(healthyRoutes({ "GET /api/atx": ATX_BOARD }));
+  checkReadCache.clear();
+  for (
+    const n of [
+      "atx-board-present",
+      "atx-not-busy",
+      "msd-enabled",
+      "msd-not-busy",
+    ] as const
+  ) {
+    const r = await withFake(
+      fake,
+      () =>
+        model.checks[n].execute({
+          globalArgs: { host: "192.0.2.10", password: "x" },
+        }),
+    );
+    assertEquals(r, { pass: true }, n);
+  }
+  assertEquals(fake.calls.map((c) => c.path), ["/api/atx", "/api/msd"]);
+});
+
+Deno.test("each check fails on its own condition, with the method's wording", async () => {
+  const cases = [
+    ["atx-board-present", {
+      "GET /api/atx": ok({ enabled: false, busy: false }),
+    }, "no ATX board"],
+    [
+      "atx-not-busy",
+      { "GET /api/atx": ok({ enabled: true, busy: true }) },
+      "already in progress",
+    ],
+    [
+      "msd-enabled",
+      { "GET /api/msd": ok({ enabled: false, busy: false }) },
+      "disabled",
+    ],
+    [
+      "msd-not-busy",
+      { "GET /api/msd": ok({ enabled: true, busy: true }) },
+      "already in progress",
+    ],
+  ] as const;
+  for (const [n, routes, msg] of cases) {
+    const r = await runCheck(n, new FakeKvm(healthyRoutes(routes)));
+    assertEquals(r.pass, false, n);
+    assertStringIncludes(r.errors![0], msg, n);
+  }
+});
+
+Deno.test("a check fails closed when its read fails, and the failure is not cached", async () => {
+  const r = await runCheck(
+    "atx-board-present",
+    new FakeKvm(healthyRoutes(), { unreachable: true }),
+  );
+  assertEquals(r.pass, false);
+  assertStringIncludes(r.errors![0], "could not read /api/atx");
+  await Promise.resolve();
+  assertEquals(checkReadCache.entries.size, 0);
+});
+
+Deno.test("the inline guard still refuses when checks are skipped", async () => {
+  // atxPress against a board that is busy: the method itself refuses.
+  const fake = new FakeKvm(
+    healthyRoutes({
+      "GET /api/atx": ok({ enabled: true, busy: true, power: "on" }),
+    }),
+  );
+  const { context } = ctx();
+  await assertRejects(
+    () =>
+      withFake(
+        fake,
+        () =>
+          model.methods.atxPress.execute(
+            parseArgs("atxPress", { action: "click_reset" }),
+            context as any,
+          ),
+      ),
+    Error,
+    "busy",
+  );
+  assertEquals(fake.posts().length, 0);
 });
