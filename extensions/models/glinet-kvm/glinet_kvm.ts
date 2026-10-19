@@ -1135,8 +1135,16 @@ async function runAtx(
     enabled,
     powerBefore: powerOf(before),
   };
-  const write = (rec: Record<string, unknown>) =>
-    context.writeResource("atx", "atx", { ...base, ...rec });
+  const write = (rec: Record<string, unknown>) => {
+    // One info line per outcome; the message is what the record stores.
+    context.logger.info("ATX {action} on {host}: {outcome}: {message}", {
+      action: args.action,
+      host: g.host,
+      outcome: rec.outcome,
+      message: rec.message,
+    });
+    return context.writeResource("atx", "atx", { ...base, ...rec });
+  };
 
   if (args.action === "status") {
     const h = await write({
@@ -1222,8 +1230,16 @@ async function runMsd(
   const record = (
     s: ReturnType<typeof summariseMsd>,
     rec: { applied: boolean; outcome: string; message: string },
-  ) =>
-    context.writeResource("msd", "msd", {
+  ) => {
+    // One info line per outcome. The message never holds a raw download URL
+    // (plans are redacted), so it is as safe to log as it is to store.
+    context.logger.info("MSD {action} on {host}: {outcome}: {message}", {
+      action: args.action,
+      host: g.host,
+      outcome: rec.outcome,
+      message: rec.message,
+    });
+    return context.writeResource("msd", "msd", {
       host: g.host,
       at: new Date().toISOString(),
       action: args.action,
@@ -1237,6 +1253,7 @@ async function runMsd(
       gadgetCdrom: gadget.cdrom,
       gadgetFlash: gadget.flash,
     });
+  };
   const refuse = async (why: string): Promise<never> => {
     await record(state, {
       applied: false,
