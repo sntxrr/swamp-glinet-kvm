@@ -40,11 +40,37 @@ success for a press wired to nothing.
 | ------------ | ----------------- | -------------------------------------------------------------------- |
 | `health`     | no                | Reachability, auth, firmware, HDMI, HID, MSD, Tailscale, posture      |
 | `screenshot` | no                | JPEG of the target's screen, stored as the `screenshot` file          |
-| `atx`        | **with `apply`**  | Power state, or power/reset buttons; refuses without an ATX board     |
-| `msd`        | **with `apply`**  | List, upload, download, attach, detach and remove virtual media       |
+| `atx`        | no                | Power state, or the plan for a button press                           |
+| `atxPress`   | **always**        | Press power/reset; refuses without an ATX board                       |
+| `msd`        | no                | Virtual media state, or the plan for a change                         |
+| `msdChange`  | **always**        | Upload, download, attach, detach and remove virtual media             |
 
-Every method that can change the device is a **dry run unless `apply: true`**.
-The dry run records exactly which calls it would make.
+Reads and writes are separate methods (since 2026.10.19.1). `atx` and `msd`
+record exactly which calls `atxPress` and `msdChange` would make with the same
+arguments, and never change the device. Before that, `atx` and `msd` acted when
+passed `apply: true`; they now **refuse** `apply: true` rather than ignoring it,
+so a caller written for the old methods fails loudly instead of silently
+becoming a dry run.
+
+**Pre-flight checks.** The write methods run labeled `live` checks first,
+scoped to them alone (swamp runs an unscoped check before every method):
+
+| Check               | Method      | Fails when                               |
+| ------------------- | ----------- | ---------------------------------------- |
+| `atx-board-present` | `atxPress`  | No ATX board is attached                 |
+| `atx-not-busy`      | `atxPress`  | An ATX operation is already in progress  |
+| `msd-enabled`       | `msdChange` | Virtual media is disabled                |
+| `msd-not-busy`      | `msdChange` | A virtual-media operation is in progress |
+
+Checks of the same endpoint share one read, and a check that cannot read the
+device fails rather than passes. The methods enforce the same conditions
+themselves, so `--skip-check-label live` only skips the early answer, never
+the guard. A refusal by a check leaves no `atx` or `msd` record (checks
+cannot write data): the check's error is its only trace, and the latest record
+still shows the previous outcome. Run `atx` or `msd` with the same arguments to
+record the refusal as a plan. Refusals that depend on the arguments (image required, file
+readable, image exists, drive function off) stay in the method: checks see
+the arguments only unvalidated.
 
 ### `health`
 
@@ -121,9 +147,10 @@ swamp model method run kvm-a screenshot
 swamp data get kvm-a screenshot --json | jq -r .contentPath
 ```
 
-### `atx`
+### `atx` and `atxPress`
 
-`action` is one of `status` (default), `on`, `off`, `off_hard`, `reset_hard`,
+`action` is one of `status` (default;
+`atx` only), `on`, `off`, `off_hard`, `reset_hard`,
 `click_power`, `click_power_long`, `click_reset`. `on` and `off` are kvmd's
 "soft" actions: they press power only if the state differs. The `click_*`
 actions press regardless.
@@ -134,11 +161,14 @@ the devices this was built against has an ATX board. Status reads and the
 no-board refusal have been verified live.
 
 ```bash
-swamp model method run kvm-a atx --input action=reset_hard              # dry run
-swamp model method run kvm-a atx --input action=reset_hard --input apply=true
+swamp model method run kvm-a atx --input action=reset_hard        # the plan; presses nothing
+swamp model method run kvm-a atxPress --input action=reset_hard
 ```
 
-### `msd`
+### `msd` and `msdChange`
+
+`msd` takes every action and records the plan; `msdChange` takes every action
+but `status` and makes the calls.
 
 | `action`     | Needs               | Device calls                                               |
 | ------------ | ------------------- | ---------------------------------------------------------- |
